@@ -33,9 +33,6 @@ use crate::Document;
 use crate::layout::table::TableContext;
 use crate::node::{TextBrush, TextInputData, TextLayout};
 
-#[cfg(feature = "custom-widget")]
-use super::custom_widget::CustomWidgetData;
-
 macro_rules! local_names {
     ($($name:tt),+) => {
         [$(local_name!($name),)+]
@@ -98,6 +95,9 @@ pub struct ElementData {
     /// Style data from stylo, plus a lock guard that allows access to it.
     pub stylo_element_data: StyloData,
     pub selector_flags: Cell<ElementSelectorFlags>,
+    /// acrender: bumped whenever paint-relevant element data (special data, loaded images) is
+    /// replaced, so cached paint fragments can tell (see blitz-paint `PaintCache`)
+    pub paint_epoch: u64,
     /// A clone of the document's shared style lock. Set when the owning
     /// [`Node`](super::Node) is constructed.
     pub guard: Option<SharedRwLock>,
@@ -324,6 +324,7 @@ impl Clone for ElementData {
             // Runtime state: reset to defaults.
             stylo_element_data: Default::default(),
             selector_flags: Cell::new(ElementSelectorFlags::empty()),
+            paint_epoch: self.paint_epoch,
             guard: self.guard.clone(),
             element_state: self.element_state,
             has_snapshot: false,
@@ -360,15 +361,10 @@ pub enum SpecialElementType {
 pub enum SpecialElementData {
     /// A sub-document such an \<iframe\> or \<web-view\> element
     SubDocument(Box<dyn Document>),
-    /// A custom widget
-    #[cfg(feature = "custom-widget")]
-    CustomWidget(CustomWidgetData),
     /// A stylesheet
     Stylesheet(DocumentStyleSheet),
     /// An \<img\> element's image data
     Image(Box<ImageData>),
-    /// A \<canvas\> element's custom paint source
-    Canvas(CanvasData),
     /// Pre-computed table layout data
     TableRoot(Arc<TableContext>),
     /// Parley text editor (text inputs)
@@ -387,11 +383,8 @@ impl Clone for SpecialElementData {
     fn clone(&self) -> Self {
         match self {
             Self::SubDocument(_) => Self::None, // TODO
-            #[cfg(feature = "custom-widget")]
-            Self::CustomWidget(_) => Self::None, // TODO
             Self::Stylesheet(data) => Self::Stylesheet(data.clone()),
             Self::Image(data) => Self::Image(data.clone()),
-            Self::Canvas(data) => Self::Canvas(data.clone()),
             Self::TableRoot(data) => Self::TableRoot(data.clone()),
             Self::TextInput(data) => Self::TextInput(data.clone()),
             Self::CheckboxInput(data) => Self::CheckboxInput(*data),
@@ -409,6 +402,11 @@ impl SpecialElementData {
 }
 
 impl ElementData {
+    /// acrender: paint-relevant data changed (see `paint_epoch`)
+    pub fn repaint(&mut self) {
+        self.paint_epoch += 1;
+    }
+
     pub fn new(name: QualName, attrs: Vec<Attribute>) -> Self {
         let id_attr_atom = attrs
             .iter()
@@ -437,6 +435,7 @@ impl ElementData {
 
             stylo_element_data: Default::default(),
             selector_flags: Cell::new(ElementSelectorFlags::empty()),
+            paint_epoch: 0,
             guard: None,
             element_state: ElementState::empty(),
             has_snapshot: false,
@@ -549,13 +548,6 @@ impl ElementData {
         }
     }
 
-    pub fn canvas_data(&self) -> Option<&CanvasData> {
-        match &self.special_data {
-            SpecialElementData::Canvas(data) => Some(data),
-            _ => None,
-        }
-    }
-
     pub fn sub_doc_data(&self) -> Option<&dyn Document> {
         match &self.special_data {
             SpecialElementData::SubDocument(data) => Some(data.as_ref()),
@@ -578,6 +570,15 @@ impl ElementData {
         }
     }
 
+    /// acrender: the drawing commands of a simple inline SVG (painted instead of `svg_data`'s tree)
+    #[cfg(feature = "svg")]
+    pub fn svg_simple(&self) -> Option<&super::simple_svg::SimpleSvg> {
+        match self.image_data()? {
+            ImageData::Svg(data) => data.simple.as_deref(),
+            _ => None,
+        }
+    }
+
     pub fn text_input_data(&self) -> Option<&TextInputData> {
         match &self.special_data {
             SpecialElementData::TextInput(data) => Some(data),
@@ -588,22 +589,6 @@ impl ElementData {
     pub fn text_input_data_mut(&mut self) -> Option<&mut TextInputData> {
         match &mut self.special_data {
             SpecialElementData::TextInput(data) => Some(data),
-            _ => None,
-        }
-    }
-
-    #[cfg(feature = "custom-widget")]
-    pub fn custom_widget_data(&self) -> Option<&CustomWidgetData> {
-        match &self.special_data {
-            SpecialElementData::CustomWidget(data) => Some(data),
-            _ => None,
-        }
-    }
-
-    #[cfg(feature = "custom-widget")]
-    pub fn custom_widget_data_mut(&mut self) -> Option<&mut CustomWidgetData> {
-        match &mut self.special_data {
-            SpecialElementData::CustomWidget(data) => Some(data),
             _ => None,
         }
     }
@@ -685,7 +670,7 @@ impl ElementData {
     pub fn flush_style_attribute(&mut self, guard: &SharedRwLock, url_extra_data: &UrlExtraData) {
         self.style_attribute = self.attr(local_name!("style")).map(|style_str| {
             ServoArc::new(guard.wrap(parse_style_attribute(
-                style_str,
+                &crate::webkit_compat::webkit_compat(style_str), // acrender
                 url_extra_data,
                 None,
                 QuirksMode::NoQuirks,
@@ -807,22 +792,6 @@ impl ElementData {
         self.special_data = SpecialElementData::None;
     }
 
-    #[cfg(feature = "custom-widget")]
-    pub fn set_custom_widget(&mut self, widget: Box<dyn crate::Widget>) {
-        use crate::node::custom_widget::CustomWidgetData;
-        self.special_data = SpecialElementData::CustomWidget(CustomWidgetData::new(widget));
-    }
-
-    #[cfg(feature = "custom-widget")]
-    pub fn remove_custom_widget(&mut self) -> Vec<anyrender::ResourceId> {
-        let resource_ids = self
-            .custom_widget_data_mut()
-            .map(|widget_data| widget_data.take_resource_ids())
-            .unwrap_or_default();
-        self.special_data = SpecialElementData::None;
-        resource_ids
-    }
-
     pub fn take_inline_layout(&mut self) -> Option<Box<TextLayout>> {
         std::mem::take(&mut self.inline_layout_data)
     }
@@ -902,17 +871,10 @@ impl ImageResourceData {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct CanvasData {
-    pub custom_paint_source_id: u64,
-}
-
 impl std::fmt::Debug for SpecialElementData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SpecialElementData::SubDocument(_) => f.write_str("NodeSpecificData::SubDocument"),
-            #[cfg(feature = "custom-widget")]
-            SpecialElementData::CustomWidget(_) => f.write_str("NodeSpecificData::CustomWidget"),
             SpecialElementData::Stylesheet(_) => f.write_str("NodeSpecificData::Stylesheet"),
             SpecialElementData::Image(data) => match **data {
                 ImageData::Raster(_) => f.write_str("NodeSpecificData::Image(Raster)"),
@@ -920,7 +882,6 @@ impl std::fmt::Debug for SpecialElementData {
                 ImageData::Svg(_) => f.write_str("NodeSpecificData::Image(Svg)"),
                 ImageData::None => f.write_str("NodeSpecificData::Image(None)"),
             },
-            SpecialElementData::Canvas(_) => f.write_str("NodeSpecificData::Canvas"),
             SpecialElementData::TableRoot(_) => f.write_str("NodeSpecificData::TableRoot"),
             SpecialElementData::TextInput(_) => f.write_str("NodeSpecificData::TextInput"),
             SpecialElementData::CheckboxInput(_) => f.write_str("NodeSpecificData::CheckboxInput"),

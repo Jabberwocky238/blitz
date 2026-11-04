@@ -1,5 +1,4 @@
 use crate::NodeTree;
-use crate::events::{DragMode, handle_dom_event};
 use crate::layout::construct::ConstructionTask;
 use crate::layout::damage::ALL_DAMAGE;
 use crate::mutator::ViewportMut;
@@ -10,22 +9,18 @@ use crate::node::{ImageData, NodeFlags, RasterImageData, SpecialElementData, Sta
 use crate::scrolling::ScrollAnimationState;
 use crate::selection::TextSelection;
 use crate::stylo_device::{DeviceChanges, make_device};
-use crate::stylo_to_cursor_icon::stylo_to_cursor_icon;
 use crate::traversal::TreeTraverser;
 use crate::url::DocumentUrl;
 use crate::util::ImageType;
 use crate::{
     DEFAULT_CSS, DocumentConfig, DocumentMutator, DummyHtmlParserProvider, ElementData,
-    EventDriver, HtmlParserProvider, Node, NodeData, NoopEventHandler, StyleThreading,
-    TextNodeData,
+    HtmlParserProvider, Node, NodeData, StyleThreading, TextNodeData,
 };
-use blitz_traits::devtools::DevtoolSettings;
-use blitz_traits::events::{DomEvent, HitResult, UiEvent};
+use blitz_traits::events::HitResult;
 use blitz_traits::navigation::{DummyNavigationProvider, NavigationProvider};
 use blitz_traits::net::{AbortSignal, DummyNetProvider, NetProvider, Request};
 use blitz_traits::node_id::NodeId;
 use blitz_traits::shell::{DummyShellProvider, ShellProvider, Viewport};
-use cursor_icon::CursorIcon;
 use linebender_resource_handle::Blob;
 use markup5ever::{LocalName, local_name};
 use parley::{FontContext, PlainEditorDriver};
@@ -53,8 +48,6 @@ use style::properties::style_structs::Font;
 use style::selector_parser::ServoElementSnapshot;
 use style::servo_arc::Arc as ServoArc;
 use style::values::GenericAtomIdent;
-use style::values::computed::UserSelect;
-use style::values::computed::ui::CursorKind;
 use style::{
     device::Device,
     dom::{TDocument, TNode},
@@ -68,9 +61,6 @@ use style_dom::ElementState;
 use thin_vec::ThinVec;
 use url::Url;
 use web_time::Instant;
-
-#[cfg(feature = "parallel-construct")]
-use thread_local::ThreadLocal;
 
 /// A user-agent stylesheet, parsed with a read-only lock so that it can be shared between documents.
 ///
@@ -166,13 +156,6 @@ pub trait Document: Any + 'static {
     fn inner(&self) -> DocGuard<'_>;
     fn inner_mut(&mut self) -> DocGuardMut<'_>;
 
-    /// Update the [`Document`] in response to a [`UiEvent`] (click, keypress, etc)
-    fn handle_ui_event(&mut self, event: UiEvent) {
-        let mut doc = self.inner_mut();
-        let mut driver = EventDriver::new(&mut *doc, NoopEventHandler);
-        driver.handle_ui_event(event);
-    }
-
     /// Poll any pending async operations, and flush changes to the underlying [`BaseDocument`]
     fn poll(&mut self, task_context: Option<TaskContext>) -> bool {
         // Default implementation does nothing
@@ -225,6 +208,33 @@ pub enum DocumentEvent {
     },
 }
 
+/// acrender: see [`BaseDocument::memory`]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemoryStats {
+    /// Live nodes
+    pub nodes: usize,
+    /// Decoded images kept by URL (raster bytes)
+    pub images: usize,
+    pub image_bytes: usize,
+    /// Fonts registered from @font-face loads, and their bytes (never unregistered)
+    pub fonts: usize,
+    pub font_bytes: usize,
+    /// Parsed SVGs cached by source text (process-wide), and their estimated bytes
+    pub svg_cache: usize,
+    pub svg_cache_bytes: usize,
+    /// Stylesheets owned by <style> / <link> elements
+    pub stylesheets: usize,
+    /// Selectors and declarations in the stylist (CSS-in-JS inserting rules grows these)
+    pub selectors: usize,
+    pub declarations: usize,
+    /// Entries of per-node side tables: id attribute map, stylo snapshots
+    pub id_map: usize,
+    /// acrender: always 0, form owners are not tracked any more (blitz-dom submits no forms);
+    /// kept for acde-base's stats
+    pub form_controls: usize,
+    pub snapshots: usize,
+}
+
 pub struct BaseDocument {
     /// ID of the document
     id: usize,
@@ -232,8 +242,6 @@ pub struct BaseDocument {
     // Config
     /// Base url for resolving linked resources (stylesheets, images, fonts, etc)
     pub(crate) url: DocumentUrl,
-    // Devtool settings. Currently used to render debug overlays
-    pub(crate) devtool_settings: DevtoolSettings,
     // Viewport details such as the dimensions, HiDPI scale, and zoom factor,
     pub(crate) viewport: Viewport,
     /// CSS media type used to evaluate `@media` rules.
@@ -278,9 +286,6 @@ pub struct BaseDocument {
     // Parley contexts
     /// A Parley font context
     pub(crate) font_ctx: Arc<Mutex<parley::FontContext>>,
-    #[cfg(feature = "parallel-construct")]
-    /// Thread-and-document-local copies to the font context
-    pub(crate) thread_font_contexts: ThreadLocal<RefCell<Box<FontContext>>>,
     /// A Parley layout context
     pub(crate) layout_ctx: parley::LayoutContext<TextBrush>,
 
@@ -302,14 +307,6 @@ pub struct BaseDocument {
     pub(crate) active_node_id: Option<NodeId>,
     /// The node which recieved a mousedown event (if any)
     pub(crate) mousedown_node_id: Option<NodeId>,
-    /// The last time a mousedown was made (for double-click detection)
-    pub(crate) last_mousedown_time: Option<Instant>,
-    /// The position where mousedown occurred (for selection drags and double-click detection)
-    pub(crate) mousedown_position: taffy::Point<f32>,
-    /// How many clicks have been made in quick succession
-    pub(crate) click_count: u16,
-    /// Whether we're currently in a text selection drag (moved 2px+ from mousedown)
-    pub(crate) drag_mode: DragMode,
     /// The scrollbar thumb currently under the pointer, if any
     pub(crate) hovered_scrollbar: Option<crate::node::ScrollbarRef>,
     /// When each scroll container's overlay scrollbars were last shown
@@ -324,8 +321,6 @@ pub struct BaseDocument {
     // TODO: collapse animating state into a bitflags
     /// Whether there are active CSS animations/transitions (so we should re-render every frame)
     pub(crate) has_active_animations: bool,
-    /// Whether there is a `<canvas>` element in the DOM (so we should re-render every frame)
-    pub(crate) has_canvas: bool,
     /// Whether there are subdocuments that are animating (so we should re-render every frame)
     pub(crate) subdoc_is_animating: bool,
 
@@ -339,28 +334,47 @@ pub struct BaseDocument {
     /// added, replaced or removed), so that CSSOM wrappers can detect that
     /// their cached rule data is stale.
     pub(crate) stylesheet_generation: u64,
-    /// Map from form control node ID's to their associated forms node ID's
-    pub(crate) controls_to_form: HashMap<NodeId, NodeId>,
     /// Nodes that contain sub documents
     pub(crate) sub_document_nodes: HashSet<NodeId>,
+    /// acrender: what each `<canvas>` has drawn (2D context commands, in its bitmap's pixels), painted
+    /// into its content box
+    pub(crate) canvas_pictures: HashMap<NodeId, Arc<acgpu::Scene>>,
+    /// acrender: simple inline SVGs built straight from the DOM (see DocumentConfig::svg_text_only)
+    pub(crate) svg_from_dom: bool,
+    /// acrender: `DocumentConfig::skip_iframe_content`
+    pub(crate) skip_iframe_content: bool,
     /// Load state (abort controller and in-flight request id) for each
     /// `<iframe>` element whose sub-document is loaded automatically
     pub(crate) iframe_loads: HashMap<NodeId, crate::iframe::IframeLoad>,
-    /// Set of changed nodes for updating the accessibility tree
-    pub(crate) changed_nodes: HashSet<NodeId>,
-    /// Set of changed nodes for updating the accessibility tree
+    /// Box construction deferred to `resolve_deferred_tasks`
     pub(crate) deferred_construction_nodes: Vec<ConstructionTask>,
 
     /// Nodes that contain custom widgets
-    #[cfg(feature = "custom-widget")]
-    pub(crate) custom_widget_nodes: HashSet<NodeId>,
     /// Rendering resources allocated by custom widgets that should be deallocated during the next render
-    #[cfg(feature = "custom-widget")]
-    pub(crate) pending_resource_deallocations: Vec<anyrender::ResourceId>,
 
     /// Cache of loaded images, keyed by URL. Allows reusing images across multiple
     /// elements without re-fetching from the network.
     pub(crate) image_cache: HashMap<String, ImageData>,
+    /// acrender: fonts registered from @font-face loads (count, bytes), see `memory`
+    pub(crate) fonts_registered: (usize, usize),
+    /// acrender: size containers' content boxes their subtrees were last styled for (resolve_containers)
+    pub(crate) container_sizes: HashMap<NodeId, (f32, f32)>,
+    /// acrender: the viewport (CSS px) the last layout ran for; resolve skips layout when it has not
+    /// changed and nothing needs relayout
+    pub(crate) laid_out_viewport: Option<(f32, f32)>,
+    /// acrender: geometry generation `refresh_hover` last ran at
+    pub(crate) hover_geometry_generation: u64,
+    /// acrender: @font-face faces registered, by hash of bytes + descriptors (the blob is the one
+    /// fontique keeps, so holding it costs nothing)
+    pub(crate) font_faces: HashMap<u64, Vec<(Blob<u8>, String)>>,
+    /// acrender: see `net::FontSources`
+    pub(crate) font_sources: crate::net::FontSources,
+    /// acrender: the font database SVG `<text>` is laid out with (see svg_fonts), and how many @font-face
+    /// faces it was made with
+    #[cfg(feature = "svg")]
+    pub(crate) svg_fonts: Option<(usize, Arc<usvg::fontdb::Database>)>,
+    /// acrender: image_cache keys, oldest first (evicted past IMAGE_CACHE_*)
+    pub(crate) image_order: std::collections::VecDeque<String>,
 
     /// Tracks in-flight image requests. When an image is being fetched, additional
     /// requests for the same URL are queued here instead of starting new fetches.
@@ -429,6 +443,8 @@ impl BaseDocument {
         style_config::set_pref!("layout.grid.enabled", true);
         style_config::set_pref!("layout.flexbox.balance", true);
         style_config::set_pref!("layout.unimplemented", true);
+        // acrender: container-type and @container (sizes from the last layout, see resolve_containers)
+        style_config::set_pref!("layout.container-queries.enabled", true);
         style_config::set_pref!("layout.columns.enabled", true);
         style_config::set_pref!("layout.css.basic-shape-shape.enabled", true);
         style_config::set_pref!("layout.css.tree-counting-functions.enabled", true);
@@ -443,7 +459,8 @@ impl BaseDocument {
         let device = make_device(&viewport, media_type.clone(), font_ctx.clone());
         let stylist = Stylist::new(device, QuirksMode::NoQuirks);
         let snapshots = SnapshotMap::new();
-        let nodes = Box::new(NodeTree::new());
+        let mut nodes = Box::new(NodeTree::new());
+        nodes.default_lang = config.default_lang.clone(); // acrender
         let guard = SharedRwLock::new();
         let nodes_to_id = HashMap::new();
 
@@ -485,13 +502,10 @@ impl BaseDocument {
             style_threading: config.style_threading,
             incremental_layout: config.incremental.unwrap_or(true),
             subdocument_depth: config.subdocument_depth,
-            devtool_settings: DevtoolSettings::default(),
             url: base_url,
             nodes_to_stylesheet: BTreeMap::new(),
             stylesheet_generation: 0,
             font_ctx,
-            #[cfg(feature = "parallel-construct")]
-            thread_font_contexts: ThreadLocal::new(),
             layout_ctx: parley::LayoutContext::new(),
 
             hover_node_id: None,
@@ -503,31 +517,31 @@ impl BaseDocument {
             mousedown_node_id: None,
             has_active_animations: false,
             subdoc_is_animating: false,
-            has_canvas: false,
             sub_document_nodes: HashSet::new(),
+            canvas_pictures: HashMap::new(),
+            svg_from_dom: !config.svg_text_only,
+            skip_iframe_content: config.skip_iframe_content,
             iframe_loads: HashMap::new(),
 
-            #[cfg(feature = "custom-widget")]
-            custom_widget_nodes: HashSet::new(),
-            #[cfg(feature = "custom-widget")]
-            pending_resource_deallocations: Vec::new(),
-
-            changed_nodes: HashSet::new(),
             deferred_construction_nodes: Vec::new(),
             image_cache: HashMap::new(),
+            fonts_registered: (0, 0),
+            container_sizes: HashMap::new(),
+            laid_out_viewport: None,
+            hover_geometry_generation: 0,
+            #[cfg(feature = "svg")]
+            svg_fonts: None,
+            font_faces: Default::default(),
+            font_sources: Default::default(),
+            image_order: Default::default(),
             pending_images: HashMap::new(),
             pending_style_image_nodes: Vec::new(),
             pending_critical_resources: HashSet::new(),
-            controls_to_form: HashMap::new(),
             net_provider,
             navigation_provider,
             shell_provider,
             html_parser_provider,
             abort_signal: config.abort_signal,
-            last_mousedown_time: None,
-            mousedown_position: taffy::Point::ZERO,
-            click_count: 0,
-            drag_mode: DragMode::None,
             hovered_scrollbar: None,
             scrollbar_activity: HashMap::new(),
             scroll_animation: ScrollAnimationState::None,
@@ -639,14 +653,6 @@ impl BaseDocument {
 
     pub fn mutate<'doc>(&'doc mut self) -> DocumentMutator<'doc> {
         DocumentMutator::new(self)
-    }
-
-    pub fn handle_dom_event<F: FnMut(DomEvent)>(
-        &mut self,
-        event: &mut DomEvent,
-        dispatch_event: F,
-    ) {
-        handle_dom_event(self, event, dispatch_event)
     }
 
     pub fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -820,36 +826,6 @@ impl BaseDocument {
         has_changes
     }
 
-    #[cfg(feature = "custom-widget")]
-    pub fn custom_widget_node_ids(&self) -> Vec<NodeId> {
-        self.custom_widget_nodes.iter().copied().collect()
-    }
-
-    #[cfg(feature = "custom-widget")]
-    pub fn take_pending_resource_deallocations(&mut self) -> Vec<anyrender::ResourceId> {
-        std::mem::take(&mut self.pending_resource_deallocations)
-    }
-
-    #[cfg(feature = "custom-widget")]
-    pub fn set_custom_widget(&mut self, node_id: NodeId, widget: Box<dyn crate::Widget>) {
-        self.nodes[node_id]
-            .element_data_mut()
-            .unwrap()
-            .set_custom_widget(widget);
-        self.custom_widget_nodes.insert(node_id);
-    }
-
-    #[cfg(feature = "custom-widget")]
-    pub fn remove_custom_widget(&mut self, node_id: NodeId) {
-        let resources_to_deallocate = self.nodes[node_id]
-            .element_data_mut()
-            .unwrap()
-            .remove_custom_widget();
-        self.pending_resource_deallocations
-            .extend_from_slice(&resources_to_deallocate);
-        self.custom_widget_nodes.remove(&node_id);
-    }
-
     pub fn root_node(&self) -> &Node {
         &self.nodes[self.root_node_id]
     }
@@ -877,9 +853,8 @@ impl BaseDocument {
         let id = self
             .nodes
             .insert_with_key(|id| Node::new(tree_ptr, id, guard, node_data));
-
-        // Mark the new node as changed.
-        self.changed_nodes.insert(id);
+        // acrender: upstream also added `id` to `changed_nodes` here, a set nothing read or cleared
+        // (it grew with every node ever created)
         id
     }
 
@@ -888,7 +863,80 @@ impl BaseDocument {
     /// it so that stale NodeIds are never dereferenced after the slot is freed.
     pub(crate) fn remove_node_from_tree(&mut self, node_id: NodeId) -> Option<Node> {
         self.clear_interaction_state_for_removed_node(node_id);
-        self.nodes.remove(node_id)
+        self.canvas_pictures.remove(&node_id);
+        let node = self.nodes.remove(node_id)?;
+        self.forget_layout_child(&node, node_id);
+        Some(node)
+    }
+
+    /// acrender: a removed node's layout parent (an anonymous block, a `display: contents` ancestor's
+    /// parent, a pseudo-element, ...) and containing block are not always its DOM parent, which is the only one marked
+    /// damaged on removal: its layout / paint child lists kept the removed key, and the next layout
+    /// (taffy's round_layout) indexed it ("invalid SlotMap key used", CodeMirror opening / closing).
+    /// Every removal path (dropping a subtree, pseudo-elements, anonymous blocks, generated text)
+    /// goes through `remove_node_from_tree`, so the lists are fixed here. The layout parent is
+    /// marked for relayout only while its ancestors are all still in the tree: inside a subtree
+    /// being dropped it is itself on its way out, and walking up would index a removed ancestor.
+    fn forget_layout_child(&mut self, node: &Node, node_id: NodeId) {
+        // An out-of-flow box is also listed by its containing block, which taffy's rounding pass
+        // walks for every node whether or not it was laid out again (CodeMirror's position:
+        // absolute cursor / selection layers, closing the editor)
+        if let Some(block) = node
+            .oof_containing_block
+            .get()
+            .and_then(|b| self.nodes.get(b))
+        {
+            block
+                .hoisted_children
+                .borrow_mut()
+                .retain(|c| *c != node_id);
+        }
+        // A positioned box is painted from its containing block's paint children or a stacking
+        // context's hoisted children, further up than its layout parent; both are only rebuilt for
+        // damaged subtrees, and hit testing reads them before the next resolve
+        // (a removed subtree's styles may already be gone: an out-of-flow box still has its block)
+        let positioned = node.oof_containing_block.get().is_some()
+            || node.primary_styles().is_some_and(|s| {
+                s.get_box().position != style::computed_values::position::T::Static
+            });
+        if positioned {
+            for start in [node.oof_containing_block.get(), node.layout_parent.get()] {
+                let mut up = start;
+                while let Some(ancestor) = up.and_then(|id| self.nodes.get_mut(id)) {
+                    if let Some(children) = ancestor.paint_children.get_mut() {
+                        children.retain(|c| *c != node_id);
+                    }
+                    if let Some(context) = ancestor.stacking_context.as_mut() {
+                        context.forget(node_id);
+                    }
+                    up = ancestor.parent;
+                }
+            }
+        }
+        let Some(layout_parent) = node
+            .layout_parent
+            .get()
+            .filter(|p| self.nodes.contains_key(*p))
+        else {
+            return;
+        };
+        let parent = &mut self.nodes[layout_parent];
+        if let Some(children) = parent.layout_children.get_mut() {
+            children.retain(|c| *c != node_id);
+        }
+        if let Some(children) = parent.paint_children.get_mut() {
+            children.retain(|c| *c != node_id);
+        }
+        let mut up = parent.parent;
+        while let Some(id) = up {
+            match self.nodes.get(id) {
+                Some(ancestor) => up = ancestor.parent,
+                None => return,
+            }
+        }
+        let parent = &mut self.nodes[layout_parent];
+        parent.insert_damage(crate::layout::damage::ALL_DAMAGE);
+        parent.mark_ancestors_dirty();
     }
 
     /// The nearest element ancestor of `node_id` that is still in the
@@ -976,14 +1024,6 @@ impl BaseDocument {
         {
             self.hovered_scrollbar = None;
         }
-        let drag_references_node = match &self.drag_mode {
-            DragMode::Panning(state) => state.target == node_id,
-            DragMode::ScrollbarDrag(state) => state.scrollbar.node_id == node_id,
-            DragMode::Selecting | DragMode::None => false,
-        };
-        if drag_references_node {
-            self.drag_mode = DragMode::None;
-        }
         self.scrollbar_activity.remove(&node_id);
     }
 
@@ -1037,11 +1077,6 @@ impl BaseDocument {
         }
 
         self.remove_node_from_tree(anon_id);
-    }
-
-    /// Whether the document has been mutated
-    pub fn has_changes(&self) -> bool {
-        self.changed_nodes.is_empty()
     }
 
     pub fn create_text_node(&mut self, text: &str) -> NodeId {
@@ -1151,6 +1186,7 @@ impl BaseDocument {
                                     guard: self.guard.clone(),
                                     net_provider: self.net_provider.clone(),
                                     abort_signal: self.abort_signal.clone(),
+                                    font_sources: self.font_sources.clone(),
                                 },
                             ),
                         );
@@ -1158,6 +1194,229 @@ impl BaseDocument {
                 }
             }
         }
+    }
+
+    /// acrender: image_cache was never evicted: every distinct URL (data: / blob: URLs a web app makes
+    /// again each time it opens) kept its decoded pixels for good. Oldest entries go past 256 images
+    /// or 64 MB; images in use stay alive in their nodes (the data is reference-counted).
+    pub(crate) fn cache_image(&mut self, url: String, image: ImageData) {
+        const MAX_IMAGES: usize = 256;
+        const MAX_BYTES: usize = 64 << 20;
+        if self.image_cache.insert(url.clone(), image).is_none() {
+            self.image_order.push_back(url);
+        }
+        while self.image_cache.len() > MAX_IMAGES || self.memory().image_bytes > MAX_BYTES {
+            let Some(old) = self.image_order.pop_front() else {
+                break;
+            };
+            self.image_cache.remove(&old);
+        }
+    }
+
+    /// acrender: what a `<canvas>` shows (`None`: nothing); the canvas is painted again
+    pub fn set_canvas_picture(&mut self, node_id: NodeId, picture: Option<Arc<acgpu::Scene>>) {
+        match picture {
+            Some(p) => _ = self.canvas_pictures.insert(node_id, p),
+            None => _ = self.canvas_pictures.remove(&node_id),
+        }
+        if let Some(element) = self
+            .nodes
+            .get_mut(node_id)
+            .and_then(|n| n.element_data_mut())
+        {
+            element.repaint();
+        }
+    }
+
+    /// acrender: bumped whenever laid-out boxes may have moved (a layout, a scroll); see `NodeTree::geometry_generation`
+    pub fn geometry_generation(&self) -> u64 {
+        self.nodes.geometry_generation()
+    }
+
+    pub fn canvas_picture(&self, node_id: NodeId) -> Option<&Arc<acgpu::Scene>> {
+        self.canvas_pictures.get(&node_id)
+    }
+
+    /// acrender: one line of text for a 2D canvas (`fillText` / `measureText`), with the document's fonts.
+    /// `family` is a CSS family list; sizes in canvas pixels
+    pub fn layout_canvas_text(
+        &mut self,
+        text: &str,
+        family: &str,
+        size: f32,
+        weight: f32,
+        italic: bool,
+    ) -> parley::Layout<crate::node::TextBrush> {
+        use parley::{FontFamily, FontStyle, FontWeight, StyleProperty};
+        let lang = self
+            .nodes
+            .default_lang
+            .as_deref()
+            .and_then(|l| parley::Language::parse(l).ok());
+        let brush = crate::node::TextBrush::from_id(self.root_node().id);
+        let mut font_ctx = self.font_ctx.lock().unwrap();
+        let mut builder = self
+            .layout_ctx
+            .ranged_builder(&mut font_ctx, text, 1.0, true);
+        builder.push_default(StyleProperty::FontFamily(FontFamily::from(family)));
+        builder.push_default(StyleProperty::FontSize(size));
+        builder.push_default(StyleProperty::FontWeight(FontWeight::new(weight)));
+        builder.push_default(StyleProperty::FontStyle(if italic {
+            FontStyle::Italic
+        } else {
+            FontStyle::Normal
+        }));
+        builder.push_default(StyleProperty::Locale(lang));
+        builder.push_default(StyleProperty::Brush(brush));
+        let mut layout = builder.build(text);
+        layout.break_all_lines(None);
+        layout
+    }
+
+    /// acrender: sizes of what the document keeps around, to find what grows in long sessions
+    pub fn memory(&self) -> MemoryStats {
+        let image_bytes = self
+            .image_cache
+            .values()
+            .map(|i| match i {
+                crate::node::ImageData::Raster(r) => r.data.len(),
+                _ => 0,
+            })
+            .sum();
+        MemoryStats {
+            nodes: self.nodes.len(),
+            images: self.image_cache.len(),
+            image_bytes,
+            fonts: self.fonts_registered.0,
+            font_bytes: self.fonts_registered.1,
+            svg_cache: crate::util::svg_cache_stats().0,
+            svg_cache_bytes: crate::util::svg_cache_stats().1,
+            stylesheets: self.nodes_to_stylesheet.len(),
+            selectors: self.stylist.num_selectors(),
+            declarations: self.stylist.num_declarations(),
+            id_map: self.nodes_to_id.values().map(|ids| ids.len()).sum(),
+            form_controls: 0,
+            snapshots: self.snapshots.len(),
+        }
+    }
+
+    /// acrender: whether some element under `node` is a `<local>` (SVG `text`, say)
+    #[cfg(feature = "svg")]
+    pub(crate) fn has_descendant(&self, node: NodeId, local: &str) -> bool {
+        self.nodes[node].children.iter().any(|&child| {
+            self.nodes[child]
+                .element_data()
+                .is_some_and(|e| &*e.name.local == local)
+                || self.has_descendant(child, local)
+        })
+    }
+
+    /// acrender: fonts for SVG `<text>` (usvg has its own font database): the document's @font-face faces,
+    /// then the system fonts fontique picks for monospace / sans-serif / serif and for Han text as
+    /// fallbacks. A few files instead of every system font (crate::util::FONT_DB). Made again when a
+    /// face is added.
+    #[cfg(feature = "svg")]
+    pub(crate) fn svg_fonts(&mut self) -> Arc<usvg::fontdb::Database> {
+        use parley::fontique::{FallbackKey, GenericFamily, Script, SourceKind};
+        use usvg::fontdb;
+        let faces = self.fonts_registered.0;
+        if let Some((n, db)) = &self.svg_fonts
+            && *n == faces
+        {
+            return db.clone();
+        }
+        let mut db = fontdb::Database::new();
+        for (blob, _) in self.font_faces.values().flatten() {
+            db.load_font_source(fontdb::Source::Binary(Arc::new(blob.clone())));
+        }
+        let lang = self
+            .nodes
+            .default_lang
+            .as_deref()
+            .and_then(|l| parley::Language::parse(l).ok());
+        let mut ctx = self.font_ctx.lock().unwrap();
+        let collection = &mut ctx.collection;
+        let han = collection
+            .fallback_families(FallbackKey::new(
+                Script::from_bytes(*b"Hani"),
+                lang.as_ref(),
+            ))
+            .next();
+        let generics = [
+            GenericFamily::Monospace,
+            GenericFamily::SansSerif,
+            GenericFamily::Serif,
+        ]
+        .map(|g| collection.generic_families(g).next());
+        for id in generics.iter().copied().chain([han]).flatten() {
+            for font in collection
+                .family(id)
+                .iter()
+                .flat_map(|f| f.fonts().to_vec())
+            {
+                if let SourceKind::Path(path) = font.source().kind() {
+                    _ = db.load_font_file(&**path);
+                }
+            }
+        }
+        let name = |id: Option<parley::fontique::FamilyId>| {
+            id.and_then(|id| collection.family_name(id))
+                .map(str::to_owned)
+        };
+        let [mono, sans, serif] = generics.map(name);
+        drop(ctx);
+        if let Some(f) = mono {
+            db.set_monospace_family(f);
+        }
+        if let Some(f) = sans {
+            db.set_sans_serif_family(f);
+        }
+        if let Some(f) = serif {
+            db.set_serif_family(f);
+        }
+        let db = Arc::new(db);
+        self.svg_fonts = Some((faces, db.clone()));
+        db
+    }
+
+    /// acrender: after a panic interrupted a mutation or a resolve, the tree may still refer to nodes
+    /// that were dropped (layout / paint child lists, hover / focus state, stylesheets), so every
+    /// later resolve would panic again. Drops those references, forgets all derived layout / paint
+    /// structure and marks everything for restyle, reconstruction and relayout.
+    pub fn repair_after_panic(&mut self) {
+        let live: std::collections::HashSet<NodeId> = self.nodes.iter().map(|(id, _)| id).collect();
+        let alive = |id: &NodeId| live.contains(id);
+        for (_, node) in self.nodes.iter_mut() {
+            node.children.retain(|id| alive(id));
+            node.anonymous_blocks.retain(|id| alive(id));
+            if node.parent.is_some_and(|p| !alive(&p)) {
+                node.parent = None;
+            }
+            node.layout_parent.set(None);
+            *node.layout_children.borrow_mut() = None;
+            *node.paint_children.borrow_mut() = None;
+            node.hoisted_children.borrow_mut().clear();
+            node.stacking_context = None;
+            node.clear_layout_cache();
+            node.insert_damage(crate::layout::damage::ALL_DAMAGE);
+            if let Some(mut data) = node.try_stylo_element_data_mut().and_then(|s| s.get_mut()) {
+                data.hint |=
+                    style::invalidation::element::restyle_hints::RestyleHint::restyle_subtree();
+            }
+            node.set_dirty_descendants();
+        }
+        for id in [
+            &mut self.hover_node_id,
+            &mut self.hover_hit_node_id,
+            &mut self.focus_node_id,
+            &mut self.active_node_id,
+        ] {
+            if id.is_some_and(|n| !alive(&n)) {
+                *id = None;
+            }
+        }
+        self.nodes_to_stylesheet.retain(|id, _| alive(id));
+        self.pending_style_image_nodes.retain(|id| alive(id));
     }
 
     pub fn process_style_element(&mut self, target_id: NodeId) {
@@ -1201,7 +1460,7 @@ impl BaseDocument {
 
     pub fn make_stylesheet(&self, css: impl AsRef<str>, origin: Origin) -> DocumentStyleSheet {
         let data = Stylesheet::from_str(
-            css.as_ref(),
+            &crate::webkit_compat::webkit_compat(css.as_ref()), // acrender
             self.url.url_extra_data(),
             origin,
             ServoArc::new(self.guard.wrap(MediaList::empty())),
@@ -1213,6 +1472,7 @@ impl BaseDocument {
                 shell_provider: self.shell_provider.clone(),
                 abort_signal: self.abort_signal.clone(),
                 import_depth: 0,
+                font_sources: self.font_sources.clone(),
             }),
             None,
             QuirksMode::NoQuirks,
@@ -1229,6 +1489,10 @@ impl BaseDocument {
     }
 
     pub fn add_stylesheet_for_node(&mut self, stylesheet: DocumentStyleSheet, node_id: NodeId) {
+        // acrender: a <link>'s stylesheet can arrive after the element was dropped
+        if self.get_node(node_id).is_none() {
+            return;
+        }
         let old = self.nodes_to_stylesheet.insert(node_id, stylesheet.clone());
         self.stylesheet_generation += 1;
 
@@ -1246,6 +1510,7 @@ impl BaseDocument {
             &self.shell_provider,
             &self.guard.read(),
             self.abort_signal.as_ref(),
+            &self.font_sources,
         );
 
         // Store data on element
@@ -1364,7 +1629,27 @@ impl BaseDocument {
                 self.apply_iframe_html(node_id, res.request_id, res.resolved_url, &html);
             }
             Resource::Font(bytes, overrides) => {
+                // acrender: each <style> / stylesheet with an @font-face fetches its fonts again (a web app
+                // opened again brings its CSS again); register a face (bytes + descriptors) only once,
+                // fontique never unregisters it
+                // (compared by hash, then by content on a hash match)
+                let descriptors = format!("{overrides:?}");
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    bytes.hash(&mut h);
+                    descriptors.hash(&mut h);
+                    h.finish()
+                };
+                let faces = self.font_faces.entry(key).or_default();
+                if faces
+                    .iter()
+                    .any(|(b, d)| *d == descriptors && b.as_ref() == &bytes[..])
+                {
+                    return;
+                }
                 let font = Blob::new(Arc::new(bytes));
+                faces.push((font.clone(), descriptors));
 
                 // Build a `FontInfoOverride` from the `@font-face` descriptors
                 // captured during stylesheet parsing. Without this, parley
@@ -1379,24 +1664,16 @@ impl BaseDocument {
                     ..Default::default()
                 };
 
+                // acrender: counted for memory()
+                self.fonts_registered.0 += 1;
+                self.fonts_registered.1 += font.len();
+
                 // TODO: Investigate eliminating double-box
                 let mut global_font_ctx = self.font_ctx.lock().unwrap();
                 global_font_ctx
                     .collection
                     .register_fonts(font.clone(), Some(info_override));
 
-                #[cfg(feature = "parallel-construct")]
-                {
-                    rayon::broadcast(|_ctx| {
-                        let mut font_ctx = self
-                            .thread_font_contexts
-                            .get_or(|| RefCell::new(Box::new(global_font_ctx.clone())))
-                            .borrow_mut();
-                        font_ctx
-                            .collection
-                            .register_fonts(font.clone(), Some(info_override));
-                    });
-                }
                 drop(global_font_ctx);
 
                 // TODO: see if we can only invalidate if resolved fonts may have changed
@@ -1421,7 +1698,7 @@ impl BaseDocument {
         );
 
         // Cache the image
-        self.image_cache.insert(url.to_string(), image.clone());
+        self.cache_image(url.to_string(), image.clone());
 
         // Apply to all waiting nodes
         for (node_id, image_type) in waiting_nodes {
@@ -1432,11 +1709,8 @@ impl BaseDocument {
             match image_type {
                 ImageType::Image => {
                     let element = node.element_data_mut().unwrap();
-                    #[cfg(feature = "custom-widget")]
-                    if element.custom_widget_data().is_some() {
-                        continue;
-                    }
                     element.special_data = SpecialElementData::Image(Box::new(image.clone()));
+                    element.repaint(); // acrender
 
                     // Clear layout cache
                     node.clear_layout_cache();
@@ -1444,6 +1718,7 @@ impl BaseDocument {
                 }
                 ImageType::Background(idx) | ImageType::Mask(idx) => {
                     let layer_image = node.element_data_mut().and_then(|el| {
+                        el.paint_epoch += 1; // acrender: see ElementData::repaint
                         let images = match image_type {
                             ImageType::Background(_) => &mut el.background_images,
                             ImageType::Mask(_) => &mut el.mask_images,
@@ -1465,6 +1740,20 @@ impl BaseDocument {
     /// then-vs-now and invalidate the affected elements.
     pub fn snapshot_node(&mut self, node_id: NodeId) {
         self.snapshot_node_impl(node_id, true)
+    }
+
+    /// acrender: [`Self::snapshot_node`] ahead of a change to the attribute `name`. The snapshot lists
+    /// the attributes the element had, so one being added would be missing from `changed_attrs` and
+    /// Stylo would not invalidate the descendants and siblings of selectors like `[data-open] .x`.
+    pub fn snapshot_attribute(&mut self, node_id: NodeId, name: &crate::QualName) {
+        self.snapshot_node(node_id);
+        let opaque_node_id = TNode::opaque(&&self.nodes[node_id]);
+        if let Some(snapshot) = self.snapshots.get_mut(&opaque_node_id) {
+            let local = GenericAtomIdent(name.local.clone());
+            if !snapshot.changed_attrs.contains(&local) {
+                snapshot.changed_attrs.push(local);
+            }
+        }
     }
 
     /// Snapshot only the node's pre-change [`ElementState`] ahead of a state change
@@ -1827,11 +2116,9 @@ impl BaseDocument {
     }
 
     /// The scrollbar thumb currently being dragged, if any.
+    /// acrender: none, blitz-dom handles no pointer events (the embedder does)
     pub fn scrollbar_drag_target(&self) -> Option<crate::node::ScrollbarRef> {
-        match &self.drag_mode {
-            DragMode::ScrollbarDrag(state) => Some(state.scrollbar),
-            _ => None,
-        }
+        None
     }
 
     /// The current opacity of `node_id`'s overlay scrollbars. They show at
@@ -1996,30 +2283,8 @@ impl BaseDocument {
         };
         let x = pos.x + self.viewport_scroll().x as f32;
         let y = pos.y + self.viewport_scroll().y as f32;
-        let prev_hover = self.hover_state();
-        let changed = self.set_hover_to(x, y);
-        if self.hover_state() != prev_hover {
-            self.update_cursor();
-        }
-        changed
-    }
-
-    /// The hover state that determines the cursor: the hovered node, the precise hit
-    /// node and whether the hit is text
-    pub(crate) fn hover_state(&self) -> (Option<NodeId>, Option<NodeId>, bool) {
-        (
-            self.hover_node_id,
-            self.hover_hit_node_id,
-            self.hover_node_is_text,
-        )
-    }
-
-    /// Send the current cursor to the shell.
-    ///
-    /// Hover updates don't send the cursor themselves: the cursor of a node hosting a
-    /// sub-document is only known once the sub-document has handled the event.
-    pub(crate) fn update_cursor(&self) {
-        self.shell_provider.set_cursor(self.get_cursor());
+        // acrender: no cursor is sent to the shell (the embedder picks its own)
+        self.set_hover_to(x, y)
     }
 
     pub fn get_hover_node_id(&self) -> Option<NodeId> {
@@ -2090,14 +2355,6 @@ impl BaseDocument {
         self.incremental_layout = enabled;
     }
 
-    pub fn devtools(&self) -> &DevtoolSettings {
-        &self.devtool_settings
-    }
-
-    pub fn devtools_mut(&mut self) -> &mut DevtoolSettings {
-        &mut self.devtool_settings
-    }
-
     pub fn subdoc(&self, node_id: NodeId) -> Option<&dyn Document> {
         self.get_node(node_id)
             .and_then(|node| node.element_data())
@@ -2111,20 +2368,8 @@ impl BaseDocument {
     }
 
     pub fn is_animating(&self) -> bool {
-        #[cfg(feature = "custom-widget")]
-        let custom_widget_is_animating = self.custom_widget_nodes.iter().any(|&node_id| {
-            self.nodes[node_id]
-                .element_data()
-                .and_then(|el| el.custom_widget_data())
-                .is_some_and(|data| data.widget.requires_redraw())
-        });
-        #[cfg(not(feature = "custom-widget"))]
-        let custom_widget_is_animating = false;
-
-        self.has_canvas
-            | self.has_active_animations
+        self.has_active_animations
             | self.subdoc_is_animating
-            | custom_widget_is_animating
             | (self.scroll_animation != ScrollAnimationState::None)
             | self.scrollbars_animating()
     }
@@ -2238,68 +2483,6 @@ impl BaseDocument {
         self.stylist.device()
     }
 
-    pub fn get_cursor(&self) -> Option<CursorIcon> {
-        // Prefer the precise hit node: `cursor` and `user-select` may be set on
-        // a pseudo-element or resolved on an anonymous box, and text hits carry
-        // is_text via the hit node. Fall back to the canonical hover node if
-        // the hit node has been removed (it is transient across resolves), and
-        // to the default cursor if the pointer is over no box.
-        let Some(node_id) = self
-            .hover_hit_node_id
-            .filter(|&id| self.nodes.contains_key(id))
-            .or(self.get_hover_node_id())
-        else {
-            return Some(CursorIcon::Default);
-        };
-        let node = &self.nodes[node_id];
-
-        if let Some(subdoc) = node.subdoc().map(|doc| doc.inner())
-            && subdoc.get_hover_node_id().is_some()
-        {
-            return subdoc.get_cursor();
-        }
-
-        let style = node.primary_styles()?;
-        let user_select = style.clone_user_select();
-        let keyword = style.clone_cursor().keyword;
-
-        // Return cursor from style if it is non-auto
-        if keyword != CursorKind::Auto {
-            return stylo_to_cursor_icon(keyword);
-        }
-
-        // Return text cursor for text inputs
-        if node
-            .element_data()
-            .is_some_and(|e| e.text_input_data().is_some())
-        {
-            return Some(CursorIcon::Text);
-        }
-
-        // Use "pointer" cursor if any ancestor is a link
-        let mut maybe_node = Some(node);
-        while let Some(node) = maybe_node {
-            if node.is_link() {
-                return Some(CursorIcon::Pointer);
-            }
-
-            maybe_node = node.layout_parent.get().map(|node_id| node.with(node_id));
-        }
-
-        // Return text cursor for text nodes
-        if self.hover_node_is_text {
-            return Some(match user_select {
-                UserSelect::Text | UserSelect::All | UserSelect::Auto | UserSelect::Contain => {
-                    CursorIcon::Text
-                }
-                UserSelect::None => CursorIcon::Default,
-            });
-        }
-
-        // Else fallback to default cursor
-        Some(CursorIcon::Default)
-    }
-
     pub fn viewport_scroll(&self) -> crate::Point<f64> {
         self.nodes.viewport_scroll()
     }
@@ -2332,10 +2515,17 @@ impl BaseDocument {
         &self,
         node_id: NodeId,
     ) -> (crate::util::Point<f32>, taffy::Layout) {
-        let mut pos = crate::util::Point { x: 0.0, y: 0.0 };
-        let mut current = Some(node_id);
-        while let Some(id) = current {
-            let node = &self.nodes[id];
+        // acrender: the node's own scroll offset moves its contents, not its border box: only the
+        // containing blocks' scroll offsets apply (a scrolled container's getBoundingClientRect
+        // moved by its own scroll offset)
+        let start = &self.nodes[node_id];
+        let mut pos = crate::util::Point {
+            x: start.unrounded_layout().location.x,
+            y: start.unrounded_layout().location.y,
+        };
+        let mut current = start.containing_block();
+        // acrender: a cached containing block can be a node dropped since (stale query watches hit it)
+        while let Some(node) = current.and_then(|id| self.nodes.get(id)) {
             pos.x += node.unrounded_layout().location.x - node.scroll_offset().x as f32;
             pos.y += node.unrounded_layout().location.y - node.scroll_offset().y as f32;
             current = node.containing_block();
@@ -2376,6 +2566,11 @@ impl BaseDocument {
 
         // Nodes with their own layout box: use it directly
         let Some(rects) = self.inline_fragment_rects(node_id) else {
+            // acrender: a text node outside inline layout (whitespace between blocks) has no box, and
+            // no layout data to read one from
+            if !(node.is_element() || node.is_anonymous()) {
+                return None;
+            }
             let pos = node.offset_top_left();
             let size = node.unrounded_layout().size;
             #[cfg(feature = "writing-mode")]
@@ -2450,9 +2645,10 @@ impl BaseDocument {
         let inline_root = node.inline_root_ancestor()?;
 
         // Fragment boxes are relative to the inline root's border box.
+        // (they move with the inline root's own scroll offset, see physical_unrounded_geometry)
         let (root_pos, _) = self.physical_unrounded_geometry(inline_root.id);
-        let origin_x = root_pos.x as f64 - self.viewport_scroll().x;
-        let origin_y = root_pos.y as f64 - self.viewport_scroll().y;
+        let origin_x = root_pos.x as f64 - inline_root.scroll_offset().x - self.viewport_scroll().x;
+        let origin_y = root_pos.y as f64 - inline_root.scroll_offset().y - self.viewport_scroll().y;
 
         Some(fragments.map(move |rect| BoundingRect {
             x: snap_to_layout_unit(origin_x + rect.left as f64),
@@ -2517,38 +2713,6 @@ impl BaseDocument {
             let driver = text_input.editor.driver(&mut font_ctx, layout_ctx);
             cb(driver)
         }
-    }
-
-    /// Recompute the scroll offset of the text input at `node_id` (if any) so that its caret
-    /// remains visible within the input's content box.
-    pub(crate) fn clamp_text_input_scroll(&mut self, node_id: NodeId) {
-        let Some(node) = self.nodes.get_mut(node_id) else {
-            return;
-        };
-
-        let content_box_width = node.final_layout().content_box_width();
-        let content_box_height = node.final_layout().content_box_height();
-
-        if let Some(text_input) = node
-            .element_data_mut()
-            .and_then(|el| el.text_input_data_mut())
-        {
-            text_input.clamp_scroll_offset(content_box_width, content_box_height);
-        }
-    }
-
-    pub(crate) fn compute_has_canvas(&self) -> bool {
-        TreeTraverser::new(self).any(|node_id| {
-            let node = &self.nodes[node_id];
-            let Some(element) = node.element_data() else {
-                return false;
-            };
-            if element.name.local == local_name!("canvas") && element.has_attr(local_name!("src")) {
-                return true;
-            }
-
-            false
-        })
     }
 
     // Text selection methods
@@ -2945,13 +3109,12 @@ mod hover_state_tests {
         doc.nodes[container].final_layout().size.height > 50.0
     }
 
-    /// Regression test: hovering bare text wrapped in an anonymous block must
-    /// report a text cursor. The hit node for such text is the anonymous
-    /// inline root itself, while the *stored* hover target is canonicalized to
-    /// the containing element — the cursor must be derived from the precise
-    /// hit node, not the canonical target.
+    /// Regression test: hovering bare text wrapped in an anonymous block is a
+    /// text hit. The hit node for such text is the anonymous inline root
+    /// itself, while the *stored* hover target is canonicalized to the
+    /// containing element.
     #[test]
-    fn hovering_text_in_anonymous_block_reports_text_cursor() {
+    fn hovering_text_in_anonymous_block_is_a_text_hit() {
         let (mut doc, container) = make_doc();
         if !text_has_size(&doc, container) {
             eprintln!("skipping: no usable font (text measures 0x0)");
@@ -2970,13 +3133,12 @@ mod hover_state_tests {
             Some(container),
             "expected the stored hover target to be the containing element"
         );
-        assert_eq!(doc.get_cursor(), Some(CursorIcon::Text));
     }
 
     /// Hovering the empty region of the anonymous block (right of the text) is
-    /// not a text hit: default cursor, same canonical hover target.
+    /// not a text hit, same canonical hover target.
     #[test]
-    fn hovering_anonymous_block_whitespace_reports_default_cursor() {
+    fn hovering_anonymous_block_whitespace_is_not_a_text_hit() {
         let (mut doc, container) = make_doc();
         if !text_has_size(&doc, container) {
             eprintln!("skipping: no usable font (text measures 0x0)");
@@ -2986,17 +3148,15 @@ mod hover_state_tests {
         doc.set_hover_to(250.0, 8.0);
         assert!(!doc.hover_node_is_text);
         assert_eq!(doc.get_hover_node_id(), Some(container));
-        assert_eq!(doc.get_cursor(), Some(CursorIcon::Default));
     }
 
-    /// Hovering below the content hits no box: default cursor (`None` would hide it).
+    /// Hovering below the content hits no box.
     #[test]
-    fn hovering_below_content_reports_default_cursor() {
+    fn hovering_below_content_hits_nothing() {
         let (mut doc, _) = make_doc();
 
         doc.set_hover_to(5.0, 250.0);
         assert_eq!(doc.get_hover_node_id(), None);
-        assert_eq!(doc.get_cursor(), Some(CursorIcon::Default));
     }
 }
 
@@ -3436,5 +3596,48 @@ mod font_face_override_tests {
             "registered family should report the CSS-declared name, \
              not the font file's internal `name` table entry",
         );
+    }
+
+    /// acrender: a stylesheet brought again does not fetch the fonts it already loaded
+    #[test]
+    fn font_face_source_is_fetched_once() {
+        use blitz_traits::net::NetHandler;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Fonts(AtomicUsize);
+        impl NetProvider for Fonts {
+            fn fetch(&self, _: usize, request: Request, handler: Box<dyn NetHandler>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                handler.bytes(
+                    request.url.to_string(),
+                    blitz_traits::net::Bytes::from_static(crate::BULLET_FONT),
+                );
+            }
+        }
+
+        let net = Arc::new(Fonts(AtomicUsize::new(0)));
+        let mut document = BaseDocument::new(DocumentConfig {
+            net_provider: Some(net.clone()),
+            base_url: Some("http://test.local/".into()),
+            ..Default::default()
+        });
+        let style = document
+            .mutate()
+            .create_element(crate::qual_name!("style", html), vec![]);
+        let css = "@font-face { font-family: A; src: url(a.ttf); }";
+        let first = document.make_stylesheet(css, Origin::Author);
+        document.add_stylesheet_for_node(first, style);
+        document.handle_messages();
+        assert_eq!(net.0.load(Ordering::Relaxed), 1);
+
+        let again = document.make_stylesheet(css, Origin::Author);
+        document.add_stylesheet_for_node(again, style);
+        assert_eq!(net.0.load(Ordering::Relaxed), 1);
+
+        // Other descriptors are another face
+        let bold = "@font-face { font-family: A; font-weight: 700; src: url(a.ttf); }";
+        let bold = document.make_stylesheet(bold, Origin::Author);
+        document.add_stylesheet_for_node(bold, style);
+        assert_eq!(net.0.load(Ordering::Relaxed), 2);
     }
 }

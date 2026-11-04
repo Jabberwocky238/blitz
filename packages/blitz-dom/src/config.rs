@@ -66,6 +66,16 @@ pub struct DocumentConfig {
     /// How deeply this document is nested within other documents
     /// (0 for a root document). Used to limit `<iframe>` nesting depth.
     pub subdocument_depth: usize,
+    /// acrender: the language of content without a `lang` attribute (a BCP 47 tag, e.g. "zh-Hans"):
+    /// given to the root element when it has none, it picks e.g. the CJK font variant.
+    pub default_lang: Option<String>,
+    /// acrender: always build inline SVGs from their serialized text (tests compare it with building
+    /// simple ones straight from the DOM)
+    pub svg_text_only: bool,
+    /// acrender: never load `<iframe>` content (`src` / `srcdoc`): the embedder shows something else
+    /// in the frame's box (acde-base binds a native window there), so a sub-document would only be
+    /// fetched, styled, laid out and painted underneath it every frame
+    pub skip_iframe_content: bool,
 }
 
 impl Default for DocumentConfig {
@@ -84,6 +94,9 @@ impl Default for DocumentConfig {
             incremental: None,
             abort_signal: None,
             subdocument_depth: 0,
+            default_lang: None,
+            svg_text_only: false,
+            skip_iframe_content: false,
         }
     }
 }

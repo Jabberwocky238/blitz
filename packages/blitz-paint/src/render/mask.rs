@@ -18,7 +18,7 @@ use crate::render::background::get_cyclic;
 
 use super::ElementCx;
 use super::background::ImageLayerStyles;
-use anyrender::PaintScene;
+use acgpu::PaintScene;
 use peniko::{BlendMode, Compose, Fill, Mix};
 use style::properties::generated::longhands::mask_composite::single_value::computed_value::T as StyloMaskComposite;
 use style::values::generics::image::GenericImage;

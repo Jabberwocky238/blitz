@@ -147,8 +147,10 @@ fn linear_gradient(
         gradient_length,
         &mut gradient,
         repeating,
+        true,
     );
-    if repeating && gradient.stops.len() > 1 {
+    // acrender: also when stops reach outside the line (non-repeating, see resolve_color_stops)
+    if gradient.stops.len() > 1 && (first_offset, last_offset) != (0.0, 1.0) {
         gradient.kind = peniko::GradientKind::Linear(LinearGradientPosition {
             start: start + (end - start) * first_offset as f64,
             end: end + (start - end) * (1.0 - last_offset) as f64,
@@ -243,6 +245,7 @@ fn radial_gradient(
                 CSSPixelLength::new(gradient_scale.x as f32),
                 &mut gradient,
                 repeating,
+                false,
             );
             let scale = if repeating && gradient.stops.len() >= 2 {
                 (last_offset - first_offset) as f64
@@ -306,6 +309,7 @@ fn resolve_length_color_stops(
     gradient_length: CSSPixelLength,
     gradient: &mut Gradient,
     repeating: bool,
+    fit_line: bool,
 ) -> (f32, f32) {
     resolve_color_stops(
         current_color,
@@ -313,6 +317,7 @@ fn resolve_length_color_stops(
         gradient_length,
         gradient,
         repeating,
+        fit_line,
         |gradient_length: CSSPixelLength, position: &LengthPercentage| -> Option<f32> {
             position
                 .to_percentage_of(gradient_length)
@@ -328,6 +333,7 @@ fn resolve_color_stops<T>(
     gradient_length: CSSPixelLength,
     gradient: &mut Gradient,
     repeating: bool,
+    fit_line: bool,
     item_resolver: impl Fn(CSSPixelLength, &T) -> Option<f32>,
 ) -> (f32, f32) {
     let mut hint: Option<f32> = None;
@@ -358,7 +364,9 @@ fn resolve_color_stops<T>(
             }
         };
 
-        if idx == 0 && !repeating && offset != 0.0 {
+        // acrender: only before a first stop past the start (one before it, e.g. at -32px, would come
+        // out of order)
+        if idx == 0 && !repeating && offset > 0.0 {
             gradient
                 .stops
                 .push(peniko::ColorStop { color, offset: 0.0 });
@@ -440,6 +448,35 @@ fn resolve_color_stops<T>(
         }
     }
 
+    // acrender: a stop before an earlier one moves up to it (spec: "fix up" color stop positions)
+    let mut max = f32::NEG_INFINITY;
+    for stop in &mut *gradient.stops {
+        stop.offset = stop.offset.max(max);
+        max = stop.offset;
+    }
+
+    // acrender: non-repeating stops outside the gradient line (`#000 calc(var(--edge) - 32px)` with --edge 0):
+    // a linear gradient (fit_line) is stretched to cover them and the caller moves the line ends (as for
+    // repeating ones); radial / conic ones are clamped into it
+    if !repeating && gradient.stops.len() > 1 {
+        let (first, last) = (
+            gradient.stops[0].offset,
+            gradient.stops[gradient.stops.len() - 1].offset,
+        );
+        if first < 0.0 || last > 1.0 {
+            if fit_line && last > first {
+                let (first, last) = (first.min(0.0), last.max(1.0));
+                for stop in &mut *gradient.stops {
+                    stop.offset = (stop.offset - first) / (last - first);
+                }
+                return (first, last);
+            }
+            for stop in &mut *gradient.stops {
+                stop.offset = stop.offset.clamp(0.0, 1.0);
+            }
+        }
+    }
+
     // Post-process the stops for repeating gradients
     if repeating && gradient.stops.len() > 1 {
         let first_offset = gradient.stops.first().unwrap().offset;
@@ -481,6 +518,7 @@ fn resolve_angle_color_stops(
         gradient_length,
         gradient,
         repeating,
+        false,
         |_gradient_length: CSSPixelLength, position: &AngleOrPercentage| -> Option<f32> {
             match position {
                 AngleOrPercentage::Angle(angle) => {

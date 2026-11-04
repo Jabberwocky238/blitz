@@ -13,17 +13,17 @@ This is a technical license review, not legal advice or a guarantee of complianc
 for a particular product. License compliance and patent/codec rights are separate
 questions.
 
-## Automated policy
+## License check
 
-The `Dependency licenses` CI job runs:
+There is no CI; run the check by hand before changing dependencies:
 
 ```sh
 cargo deny --workspace --all-features --locked check licenses
 ```
 
 Install the tool locally with `cargo install cargo-deny --locked`. `deny.toml`
-checks all workspace members, including private examples, build dependencies and
-dev dependencies. All features are enabled and there is no target filter, so
+checks all workspace members (`blitz-dom`, `blitz-paint`, `blitz-traits`,
+`stylo_taffy`, `debug_timer`), build dependencies and dev dependencies. All features are enabled and there is no target filter, so
 Windows, Apple, Linux, Android and Wasm dependencies are checked together without
 having to build those targets. Only the license check runs; this is not an
 advisory, duplicate-dependency or dependency-source audit.
@@ -31,14 +31,16 @@ advisory, duplicate-dependency or dependency-source audit.
 All license expressions must be satisfied by the explicit allowlist, which allows
 permissive licenses and MPL-2.0 globally. Unknown/unlicensed packages and licenses
 outside this list (including GPL, AGPL and LGPL) fail. Do not add a license merely
-to make CI green: review its terms and the dependency's actual license files first.
+to make the check pass: review its terms and the dependency's actual license files first.
 
 ## Review of library dependencies
 
-The review below covers the `blitz` and `dioxus-native` libraries and their
-runtime/build dependencies, with all features of those library crates enabled and
-no target filtering. It excludes dev-only and app-only dependencies; CI
-intentionally checks the broader workspace.
+The review below was made upstream, on the `blitz` and `dioxus-native` libraries
+and their runtime/build dependencies, with all features of those library crates
+enabled and no target filtering, excluding dev-only and app-only dependencies.
+This fork keeps only some of those crates (see the workspace members above), so its
+dependency graph is a subset of the one reviewed; the package counts below are
+upstream's.
 
 cargo-deny 0.20.2 identified 426 packages in the `blitz` graph and 675 in the
 `dioxus-native` graph, with 676 distinct packages across the two graphs.

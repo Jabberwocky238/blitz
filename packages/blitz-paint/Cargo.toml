@@ -1,6 +1,6 @@
 [package]
 name = "blitz-paint"
-description = "Paint a Blitz Document using anyrender"
+description = "Paint a Blitz Document into acgpu's 2D scene"
 documentation = "https://docs.rs/blitz-paint"
 version.workspace = true
 license.workspace = true
@@ -13,8 +13,8 @@ rust-version.workspace = true
 [features]
 default = ["svg"]
 tracing = ["dep:tracing"]
-svg = ["dep:anyrender_svg", "dep:usvg", "blitz-dom/svg"]
-custom-widget = ["blitz-dom/custom-widget"]
+# acrender: SVG painted by our svg.rs (was anyrender_svg): usvg with text, embedded raster images decoded by image
+svg = ["dep:usvg", "dep:image", "blitz-dom/svg"]
 font-embolden = []
 apple-font-embolden = []
 # Paint overlay scrollbar thumbs on scroll containers, and enable their
@@ -24,14 +24,12 @@ scrollbars = ["blitz-dom/scrollbars"]
 
 [dependencies]
 # Blitz dependencies
-anyrender = { workspace = true }
-anyrender_svg = { workspace = true, optional = true }
+acgpu = { workspace = true }
 blitz-traits = { workspace = true }
 blitz-dom = { workspace = true }
 
 # Servo dependencies
 style = { workspace = true }
-euclid = { workspace = true }
 
 # DioxusLabs dependencies
 taffy = { workspace = true }
@@ -42,7 +40,8 @@ skrifa = { workspace = true }
 color = { workspace = true }
 peniko = { workspace = true }
 kurbo = { workspace = true }
-usvg = { workspace = true, optional = true }
+usvg = { workspace = true, optional = true, features = ["text", "memmap-fonts", "system-fonts"] }
+image = { workspace = true, optional = true, features = ["png", "gif", "jpeg", "webp"] }
 
 # Other dependencies
 bytemuck = { workspace = true }

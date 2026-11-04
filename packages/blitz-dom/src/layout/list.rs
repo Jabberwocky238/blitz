@@ -27,14 +27,25 @@ pub(super) fn collect_list_item_children(
     for child in children.into_iter() {
         if let Some(layout) = node_list_item_child(doc, child, *index) {
             let node = &mut doc.nodes[child];
-            node.element_data_mut().unwrap().list_item_data = Some(Box::new(layout));
+            let element = node.element_data_mut().unwrap();
+            // acrender: the painted marker is cached with the element (see ElementData::repaint)
+            if element
+                .list_item_data
+                .as_ref()
+                .is_none_or(|old| old.marker != layout.marker)
+            {
+                element.repaint();
+            }
+            element.list_item_data = Some(Box::new(layout));
             *index += 1;
             collect_list_item_children(doc, index, reversed, child);
         } else {
             // Unset marker in case it was previously set
             let node = &mut doc.nodes[child];
             if let Some(element_data) = node.element_data_mut() {
-                element_data.list_item_data = None;
+                if element_data.list_item_data.take().is_some() {
+                    element_data.repaint(); // acrender
+                }
             }
         }
     }

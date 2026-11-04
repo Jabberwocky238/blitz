@@ -1,22 +1,12 @@
 //! Resolve style and layout
 
 use blitz_traits::node_id::NodeId;
-use std::cell::RefCell;
 
 use debug_timer::debug_timer;
 use kurbo::{Affine, Rect};
-use parley::LayoutContext;
 use selectors::Element as _;
 use style::dom::TDocument;
-
-#[cfg(feature = "parallel-construct")]
-use rayon::prelude::*;
-
-// FIXME: static thread_local FontCtx isn't necessarily correct in multi-document context.
-// Should use thread_local crate with ThreadLocal value store in the Document.
-thread_local! {
-    pub(crate) static LAYOUT_CTX: RefCell<Option<Box<LayoutContext<TextBrush>>>> = const { RefCell::new(None) };
-}
+use style::selector_parser::RestyleDamage;
 
 use taffy::AvailableSpace;
 
@@ -28,10 +18,10 @@ use crate::{
             ConstructionTask, ConstructionTaskData, ConstructionTaskResult,
             ConstructionTaskResultData, LayoutChildren, collect_layout_children,
         },
-        damage::{ALL_DAMAGE, CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC},
+        damage::{ALL_DAMAGE, CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC, ONLY_RELAYOUT},
         inline::build_inline_layout_into,
     },
-    node::TextBrush,
+    node::NodeData,
 };
 
 impl BaseDocument {
@@ -79,39 +69,58 @@ impl BaseDocument {
         // accumulated since the last resolve as a single device rebuild.
         self.flush_pending_device_changes();
 
-        // we need to resolve stylist first since it will need to drive our layout bits
-        self.resolve_stylist(current_time_for_animations);
-        timer.record_time("style");
+        // acrender: whether layout ran, and the damage that reached the root (in any pass)
+        let mut laid_out = false;
+        let mut root_damage = RestyleDamage::empty();
 
-        // Non-incremental mode is "every node is damaged every frame": mark the
-        // whole tree and let the same damage pipeline reconstruct and relayout
-        // everything.
-        if !self.incremental_layout {
-            self.mark_all_damaged();
-            timer.record_time("mark_all");
+        // acrender: style .. layout again (at most twice more) when a size container came out of layout
+        // with another size than its subtree was styled for (see resolve_containers)
+        for pass in 0..3 {
+            // we need to resolve stylist first since it will need to drive our layout bits
+            self.resolve_stylist(current_time_for_animations);
+            timer.record_time("style");
+
+            // Non-incremental mode is "every node is damaged every frame": mark the
+            // whole tree and let the same damage pipeline reconstruct and relayout
+            // everything.
+            if !self.incremental_layout {
+                self.mark_all_damaged();
+                timer.record_time("mark_all");
+            }
+
+            // Propagate damage flags (from mutation and restyles) up and down the tree
+            let damage = self.propagate_damage_flags(root_node_id);
+            root_damage |= damage;
+            timer.record_time("damage");
+
+            // Fix up tree for layout (insert anonymous blocks as necessary, etc)
+            self.resolve_layout_children();
+            #[cfg(debug_assertions)]
+            self.assert_layout_parents_consistent();
+            timer.record_time("construct");
+
+            let deferred_tasks = !self.deferred_construction_nodes.is_empty();
+            self.resolve_deferred_tasks();
+            // Flush background/mask images from style to dedicated storage on the
+            // nodes whose style changed (queued by the style traversal and by
+            // pseudo-element box construction), fetching any not-yet-loaded images.
+            self.flush_pending_style_images();
+            timer.record_time("pconstruct");
+
+            // Next we resolve layout with the data resolved by stlist
+            // acrender: unless it would only replay the root's cached layout and round every node again
+            if deferred_tasks || self.needs_layout(root_node_id, damage) {
+                self.resolve_layout();
+                laid_out = true;
+            }
+            timer.record_time("layout");
+            if pass == 2 || !self.resolve_containers() {
+                break;
+            }
         }
-
-        // Propagate damage flags (from mutation and restyles) up and down the tree
-        self.propagate_damage_flags(root_node_id);
-        timer.record_time("damage");
-
-        // Fix up tree for layout (insert anonymous blocks as necessary, etc)
-        self.resolve_layout_children();
-        #[cfg(debug_assertions)]
-        self.assert_layout_parents_consistent();
-        timer.record_time("construct");
-
-        self.resolve_deferred_tasks();
-        // Flush background/mask images from style to dedicated storage on the
-        // nodes whose style changed (queued by the style traversal and by
-        // pseudo-element box construction), fetching any not-yet-loaded images.
-        self.flush_pending_style_images();
-        timer.record_time("pconstruct");
-
-        // Next we resolve layout with the data resolved by stlist
-        self.resolve_layout();
-        timer.record_time("layout");
-        self.nodes.bump_geometry_generation();
+        if laid_out {
+            self.nodes.bump_geometry_generation();
+        }
 
         // Resolve transforms
         self.resolve_transforms(root_node_id);
@@ -136,7 +145,13 @@ impl BaseDocument {
         // pass (the clearing loop would otherwise wipe them). Any resulting
         // restyle is picked up on the next resolve pass; a redraw is requested
         // if the hovered node actually changes.
-        self.refresh_hover();
+        // acrender: only when something may have moved or changed what is hit: any damage (style,
+        // transforms, removed nodes) or new geometry (layout, scroll)
+        let generation = self.nodes.geometry_generation();
+        if !root_damage.is_empty() || generation != self.hover_geometry_generation {
+            self.hover_geometry_generation = generation;
+            self.refresh_hover();
+        }
 
         let mut subdoc_is_animating = false;
         for &node_id in &self.sub_document_nodes {
@@ -166,6 +181,53 @@ impl BaseDocument {
         timer.record_time("subdocs");
 
         timer.print_times(&format!("Resolve({}): ", self.id()));
+    }
+
+    /// acrender: whether layout can change anything: something below the root needs relayout or
+    /// reconstruction, the root's cached layout is gone, or the viewport changed. Otherwise taffy would
+    /// return the root's cached layout and `round_layout` would walk the whole tree for the same result.
+    fn needs_layout(&mut self, root_node_id: NodeId, root_damage: RestyleDamage) -> bool {
+        let size = self.stylist.device().au_viewport_size();
+        let viewport = (size.width.to_f32_px(), size.height.to_f32_px());
+        let needed = root_damage.intersects(ONLY_RELAYOUT | CONSTRUCT_BOX | CONSTRUCT_FC)
+            || self.laid_out_viewport != Some(viewport)
+            || self.nodes[root_node_id]
+                .try_layout_data_mut()
+                .is_none_or(|data| data.cache.is_empty());
+        self.laid_out_viewport = Some(viewport);
+        needed
+    }
+
+    /// acrender: size containers (`container-type` not `normal`) whose content box changed since their
+    /// subtree was last styled get the subtree restyled; whether any did (resolve then runs style ..
+    /// layout again, so `@container` rules see this layout's sizes)
+    fn resolve_containers(&mut self) -> bool {
+        use style::values::computed::ContainerType;
+        let mut changed = Vec::new();
+        // the known containers (the style traversal adds new ones); gone or no longer containers drop out
+        self.container_sizes.retain(|id, _| {
+            self.nodes
+                .get(*id)
+                .and_then(|n| n.primary_styles())
+                .is_some_and(|s| s.get_box().container_type != ContainerType::NORMAL)
+        });
+        for (&id, &old) in &self.container_sizes {
+            let l = self.nodes[id].final_layout();
+            let size = (
+                l.size.width - l.border.left - l.border.right - l.padding.left - l.padding.right,
+                l.size.height - l.border.top - l.border.bottom - l.padding.top - l.padding.bottom,
+            );
+            if old != size {
+                changed.push((id, size));
+            }
+        }
+        for &(id, size) in &changed {
+            self.container_sizes.insert(id, size);
+            self.nodes[id].set_restyle_hint(
+                style::invalidation::element::restyle_hints::RestyleHint::RESTYLE_DESCENDANTS,
+            );
+        }
+        !changed.is_empty()
     }
 
     fn resolve_transforms(&mut self, node_id: NodeId) -> Rect {
@@ -295,16 +357,20 @@ impl BaseDocument {
 
                 damage.remove(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                 // damage.insert(RestyleDamage::RELAYOUT | RestyleDamage::REPAINT);
-            } else {
-                //if damage.contains(CONSTRUCT_DESCENDENT) {
+            } else if damage.contains(CONSTRUCT_DESCENDENT)
+                || matches!(doc.nodes[node_id].data, NodeData::Document(_))
+            {
+                // acrender: only into subtrees with construction damage (it reaches every ancestor as
+                // CONSTRUCT_BOX, or CONSTRUCT_DESCENDENT past a container re-sorting its children or an
+                // inline `<svg>`; the document node gets no damage, see propagate_damage_flags); upstream
+                // walked the whole tree every resolve
                 let layout_children = doc.nodes[node_id].layout_children.borrow_mut().take();
-                if let Some(layout_children) = layout_children {
+                if let Some(mut layout_children) = layout_children {
+                    // Anonymous blocks and pseudo-elements can be removed from the
+                    // slab between render passes; drop stale IDs (acrender: skipping them left
+                    // them for taffy, which indexes every layout child).
+                    layout_children.retain(|child_id| doc.nodes.contains_key(*child_id));
                     for child_id in layout_children.iter().copied() {
-                        // Anonymous blocks and pseudo-elements can be removed from the
-                        // slab between render passes; skip stale IDs.
-                        if !doc.nodes.contains_key(child_id) {
-                            continue;
-                        }
                         resolve_layout_children_recursive(doc, child_id);
                         doc.nodes[child_id].layout_parent.set(Some(node_id));
                     }
@@ -354,48 +420,21 @@ impl BaseDocument {
         deferred_construction_nodes.sort_unstable_by_key(|task| task.node_id);
         deferred_construction_nodes.dedup_by_key(|task| task.node_id);
 
-        #[cfg(feature = "parallel-construct")]
-        let iter = deferred_construction_nodes.into_par_iter();
-        #[cfg(not(feature = "parallel-construct"))]
-        let iter = deferred_construction_nodes.into_iter();
-
-        let results: Vec<ConstructionTaskResult> = iter
+        // acrender: sequential (the parallel-construct feature is gone), one font context lock
+        let mut font_ctx = self.font_ctx.lock().unwrap();
+        let results: Vec<ConstructionTaskResult> = deferred_construction_nodes
+            .into_iter()
             .map(|task: ConstructionTask| match task.data {
                 ConstructionTaskData::InlineLayout(mut layout) => {
-                    #[cfg(feature = "parallel-construct")]
-                    let mut layout_ctx = LAYOUT_CTX
-                        .take()
-                        .unwrap_or_else(|| Box::new(LayoutContext::new()));
-                    #[cfg(feature = "parallel-construct")]
-                    let layout_ctx_mut = &mut layout_ctx;
-
-                    #[cfg(feature = "parallel-construct")]
-                    let mut font_ctx = self
-                        .thread_font_contexts
-                        .get_or(|| RefCell::new(Box::new(self.font_ctx.lock().unwrap().clone())))
-                        .borrow_mut();
-                    #[cfg(feature = "parallel-construct")]
-                    let font_ctx_mut = &mut *font_ctx;
-
-                    #[cfg(not(feature = "parallel-construct"))]
-                    let layout_ctx_mut = &mut self.layout_ctx;
-                    #[cfg(not(feature = "parallel-construct"))]
-                    let font_ctx_mut = &mut *self.font_ctx.lock().unwrap();
-
                     layout.content_widths = None;
                     build_inline_layout_into(
                         &self.nodes,
-                        layout_ctx_mut,
-                        font_ctx_mut,
+                        &mut self.layout_ctx,
+                        &mut font_ctx,
                         &mut layout,
                         self.viewport.scale(),
                         task.node_id,
                     );
-
-                    #[cfg(feature = "parallel-construct")]
-                    {
-                        LAYOUT_CTX.set(Some(layout_ctx));
-                    }
 
                     // If layout doesn't contain any inline boxes, then it is safe to populate the content_widths
                     // cache during this parallelized stage.
@@ -410,6 +449,7 @@ impl BaseDocument {
                 }
             })
             .collect();
+        drop(font_ctx);
 
         for result in results {
             match result.data {

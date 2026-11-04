@@ -1433,6 +1433,12 @@ impl Node {
         let mut y = y - self.final_layout().location.y + self.scroll_offset().y as f32;
 
         if let Some(t) = self.transform().as_deref() {
+            // acrender: a non-invertible transform (`scale(0)`) shows nothing, so nothing in it is hit
+            // (its inverse is all NaN / infinite, which upstream compared its way to arbitrary hits)
+            let det = t.determinant();
+            if !det.is_finite() || det.abs() < 1e-12 {
+                return None;
+            }
             let p = t.inverse() * kurbo::Point::new(x as f64 * scale, y as f64 * scale);
             x = (p.x / scale) as f32;
             y = (p.y / scale) as f32;
@@ -1512,7 +1518,10 @@ impl Node {
 
         // Call `.hit()` on each child in turn. If any return `Some` then return that value. Else return `Some(self.id).
         for child_id in self.paint_children.borrow().iter().flatten().rev() {
-            let child = self.with(*child_id);
+            // acrender: a list the next resolve has not rebuilt yet may still name a removed node
+            let Some(child) = self.tree().get(*child_id) else {
+                continue;
+            };
             let child_position = child.taffy_position();
             let mut child_x = x;
             let mut child_y = y;
@@ -1804,7 +1813,10 @@ impl Node {
                         union(&mut line_rect, x0, y0, x1, y1);
                     }
                     PositionedLayoutItem::InlineBox(inline_box) => {
-                        if !is_in_target(NodeId::from_u64(inline_box.id)) {
+                        // acrender: a span's edges count for the span (its padding / border)
+                        let id = crate::node::InlineEdge::of(inline_box.id)
+                            .map_or(NodeId::from_u64(inline_box.id), |e| e.node);
+                        if !is_in_target(id) {
                             continue;
                         }
                         let x0 = inline_box.x;

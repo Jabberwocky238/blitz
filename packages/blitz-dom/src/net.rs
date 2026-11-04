@@ -26,6 +26,11 @@ use url::Url;
 
 use crate::{document::DocumentEvent, util::ImageType};
 
+/// acrender: the `@font-face` sources (url + descriptors, hashed) a document has loaded a font from.
+/// A stylesheet brought again (a web app opened again) does not fetch and decode them again: fontique
+/// keeps every font registered.
+pub(crate) type FontSources = Arc<std::sync::Mutex<std::collections::HashSet<u64>>>;
+
 pub(crate) fn stamped_request(url: Url, signal: Option<&AbortSignal>) -> Request {
     let mut req = Request::get(url);
     if let Some(sig) = signal {
@@ -138,6 +143,7 @@ pub struct StylesheetHandler {
     pub guard: SharedRwLock,
     pub net_provider: Arc<dyn NetProvider>,
     pub abort_signal: Option<AbortSignal>,
+    pub(crate) font_sources: FontSources,
 }
 
 impl NetHandler for ResourceHandler<StylesheetHandler> {
@@ -150,7 +156,7 @@ impl NetHandler for ResourceHandler<StylesheetHandler> {
         // let escaped_css = html_escape::decode_html_entities(css);
 
         let sheet = Stylesheet::from_str(
-            css,
+            &crate::webkit_compat::webkit_compat(css), // acrender
             self.data.source_url.clone().into(),
             Origin::Author,
             ServoArc::new(self.data.guard.wrap(MediaList::empty())),
@@ -162,6 +168,7 @@ impl NetHandler for ResourceHandler<StylesheetHandler> {
                 shell_provider: self.shell_provider.clone(),
                 abort_signal: self.data.abort_signal.clone(),
                 import_depth: 0,
+                font_sources: self.data.font_sources.clone(),
             }),
             None, // error_reporter
             QuirksMode::NoQuirks,
@@ -191,6 +198,7 @@ pub(crate) struct StylesheetLoader {
     /// Depth of `@import` nesting for the stylesheet this loader is parsing
     /// (0 for a top-level stylesheet)
     pub(crate) import_depth: usize,
+    pub(crate) font_sources: FontSources,
 }
 impl ServoStylesheetLoader for StylesheetLoader {
     fn request_stylesheet(
@@ -267,7 +275,7 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
         // let escaped_css = html_escape::decode_html_entities(css);
 
         let sheet = ServoArc::new(Stylesheet::from_str(
-            css,
+            &crate::webkit_compat::webkit_compat(css), // acrender
             UrlExtraData(self.data.url.clone()),
             Origin::Author,
             self.data.media.clone(),
@@ -288,6 +296,7 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
             &self.shell_provider,
             &self.data.lock.read(),
             self.data.loader.abort_signal.as_ref(),
+            &self.data.loader.font_sources,
         );
 
         let import_rule = self.data.import_rule.clone();
@@ -298,10 +307,20 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
 struct FontFaceHandler {
     format: FontFaceSourceFormatKeyword,
     overrides: FontFaceOverrides,
+    /// acrender: see FontSources
+    source: u64,
+    font_sources: FontSources,
 }
 impl NetHandler for ResourceHandler<FontFaceHandler> {
     fn bytes(mut self: Box<Self>, resolved_url: String, bytes: Bytes) {
         let result = self.data.parse(bytes);
+        if let Ok(Resource::Font(..)) = result {
+            self.data
+                .font_sources
+                .lock()
+                .unwrap()
+                .insert(self.data.source);
+        }
         self.respond(resolved_url, result)
     }
 }
@@ -387,6 +406,7 @@ pub(crate) fn fetch_font_face(
     shell_provider: &Arc<dyn ShellProvider>,
     read_guard: &SharedRwLockReadGuard,
     abort_signal: Option<&AbortSignal>,
+    font_sources: &FontSources,
 ) {
     fetch_font_face_rules(
         sheet.contents(read_guard).rules(read_guard).iter(),
@@ -397,6 +417,7 @@ pub(crate) fn fetch_font_face(
         shell_provider,
         read_guard,
         abort_signal,
+        font_sources,
     )
 }
 
@@ -411,6 +432,7 @@ pub(crate) fn fetch_font_face_rules<'a>(
     shell_provider: &Arc<dyn ShellProvider>,
     read_guard: &SharedRwLockReadGuard,
     abort_signal: Option<&AbortSignal>,
+    font_sources: &FontSources,
 ) {
     rules
         .filter_map(|rule| match rule {
@@ -503,6 +525,17 @@ pub(crate) fn fetch_font_face_rules<'a>(
                 });
 
             if let Some((url, format)) = preferred_source {
+                // acrender: skip sources a font was already loaded from (see FontSources)
+                let source = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    url.as_str().hash(&mut h);
+                    format!("{overrides:?}").hash(&mut h);
+                    h.finish()
+                };
+                if font_sources.lock().unwrap().contains(&source) {
+                    return;
+                }
                 network_provider.fetch(
                     doc_id,
                     stamped_request(url, abort_signal),
@@ -511,7 +544,12 @@ pub(crate) fn fetch_font_face_rules<'a>(
                         doc_id,
                         node_id,
                         shell_provider.clone(),
-                        FontFaceHandler { format, overrides },
+                        FontFaceHandler {
+                            format,
+                            overrides,
+                            source,
+                            font_sources: font_sources.clone(),
+                        },
                     ),
                 );
             }
@@ -591,7 +629,7 @@ impl ImageHandler {
         #[cfg(feature = "svg")]
         let svg_err = {
             use crate::util::parse_svg_image;
-            match parse_svg_image(&bytes) {
+            match parse_svg_image(&bytes, None) {
                 Ok(svg) => return Ok(Resource::Svg(self.kind, svg)),
                 Err(e) => e.to_string(),
             }

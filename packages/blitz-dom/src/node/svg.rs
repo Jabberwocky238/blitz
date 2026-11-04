@@ -76,8 +76,10 @@ impl SvgIntrinsicDimensions {
 /// attributes, which are captured at parse time.
 #[derive(Debug, Clone)]
 pub struct SvgImageData {
-    /// The parsed SVG tree.
+    /// The parsed SVG tree. acrender: for a `simple` SVG this is only the root (size and viewBox).
     pub tree: Arc<usvg::Tree>,
+    /// acrender: drawing commands for a simple SVG, painted instead of `tree` (see simple_svg.rs)
+    pub simple: Option<Arc<super::simple_svg::SimpleSvg>>,
     /// The dimensions declared on the root `<svg>` element.
     pub intrinsic_dimensions: SvgIntrinsicDimensions,
 }
@@ -109,8 +111,79 @@ impl SvgImageData {
         let tree = usvg::Tree::from_xmltree(&doc, options)?;
         Ok(Self {
             tree: Arc::new(tree),
+            simple: None,
             intrinsic_dimensions: SvgIntrinsicDimensions::from_xmltree(&doc),
         })
+    }
+
+    /// acrender: a simple SVG (see simple_svg.rs) without parsing it with usvg. `shell` parses just the
+    /// root element (`width`/`height`/`viewBox`/`preserveAspectRatio`) for the size, and each `<text>` on
+    /// its own; `parse` is the caller's cached usvg parse. `None` when the SVG is not simple.
+    pub fn simple(
+        source: &str,
+        parse: impl Fn(&[u8]) -> Result<SvgImageData, usvg::Error>,
+    ) -> Option<Self> {
+        let doc = roxmltree::Document::parse(source).ok()?;
+        let root = doc.root_element();
+        let shell = Self::shell(|name| root.attribute(name), &parse)?;
+        let size = shell.tree.size();
+        let text = |mini: &str| parse(mini.as_bytes()).ok().map(|svg| svg.tree);
+        let simple = super::simple_svg::SimpleSvg::parse(
+            source,
+            (size.width().into(), size.height().into()),
+            &text,
+        )?;
+        Some(Self {
+            simple: Some(Arc::new(simple)),
+            ..shell
+        })
+    }
+
+    /// acrender: [`Self::simple`] straight from the DOM (`node` is the root `<svg>`): the same pairs, without
+    /// serializing and re-parsing the text. `None` when the SVG is not simple or might come out differently
+    pub(crate) fn simple_dom(
+        node: &crate::Node,
+        viewport: (f32, f32),
+        parse: impl Fn(&[u8]) -> Result<SvgImageData, usvg::Error>,
+    ) -> Option<Self> {
+        let element = node.svg_element(true, viewport)?;
+        let attr = |name: &str| {
+            let (_, v) = element.attrs.iter().find(|(n, _)| n == name)?;
+            Some(v.as_str())
+        };
+        let shell = Self::shell(attr, &parse)?;
+        let size = shell.tree.size();
+        let text = |mini: &str| parse(mini.as_bytes()).ok().map(|svg| svg.tree);
+        let simple = super::simple_svg::SimpleSvg::from_dom(
+            node,
+            viewport,
+            (size.width().into(), size.height().into()),
+            &text,
+        )?;
+        Some(Self {
+            simple: Some(Arc::new(simple)),
+            ..shell
+        })
+    }
+
+    /// acrender: the root element alone (the attributes that size it), parsed with `parse`
+    fn shell<'v>(
+        attr: impl Fn(&str) -> Option<&'v str>,
+        parse: impl Fn(&[u8]) -> Result<SvgImageData, usvg::Error>,
+    ) -> Option<Self> {
+        let mut root_only = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\"");
+        for name in ["width", "height", "viewBox", "preserveAspectRatio"] {
+            if let Some(v) = attr(name) {
+                root_only.push_str(&format!(
+                    " {name}=\"{}\"",
+                    v.replace('&', "&amp;")
+                        .replace('"', "&quot;")
+                        .replace('<', "&lt;")
+                ));
+            }
+        }
+        root_only.push_str("/>");
+        parse(root_only.as_bytes()).ok()
     }
 
     /// The intrinsic width in CSS px, present only when the root `<svg>`

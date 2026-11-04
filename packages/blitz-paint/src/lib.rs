@@ -1,23 +1,28 @@
-//! Paint a [`blitz_dom::BaseDocument`] by pushing [`anyrender`] drawing commands into
-//! an impl [`anyrender::PaintScene`].
+//! Paint a [`blitz_dom::BaseDocument`] by pushing drawing commands into an impl of acgpu's
+//! [`acgpu::PaintScene`] (acrender: the 2D scene is acgpu's, anyrender is gone).
 
 #![allow(clippy::collapsible_if)]
 
+mod cache;
 mod color;
-mod debug_overlay;
 mod filters;
 mod gradient;
 mod kurbo_css;
 mod layers;
 mod render;
 mod sizing;
+#[cfg(feature = "svg")]
+mod svg;
 mod text;
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 
-use anyrender::{PaintScene, Scene};
+use acgpu::{PaintScene, Scene};
 use blitz_dom::{BaseDocument, NodeId, util::Color};
 use render::BlitzDomPainter;
+
+pub use cache::{CacheStats, Change, PaintCache, Piece, Run};
+pub use render::placed;
 
 const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
     feature = "font-embolden",
@@ -28,11 +33,8 @@ const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
 /// The default color for text selection highlights
 const SELECTION_COLOR: Color = Color::from_rgb8(180, 213, 255);
 
-/// Pre-computed `Scene`s for each CustomWidget, keyed by `(document id, node id)`
-type CustomWidgetSceneMap = HashMap<(usize, NodeId), Scene>;
-
 /// Paint a [`blitz_dom::BaseDocument`] by pushing drawing commands into
-/// an impl [`anyrender::PaintScene`].
+/// an impl [`acgpu::PaintScene`].
 ///
 /// This function assumes that the styles and layout in the [`BaseDocument`] are already
 /// resolved. Please ensure that this is the case before trying to paint.
@@ -49,25 +51,12 @@ pub fn paint_scene(
     x_offset: u32,
     y_offset: u32,
 ) {
-    // Run `.paint()` on every custom widget in the document (and all subdocuments) ahead of time.
-    // This helps us avoid borrow-checker issues as we recurse down the tree (`.paint()` require `&mut self`).
-    //
-    // TODO: Take widget and sub-document visibility into account
-    #[allow(unused_mut)]
-    let mut custom_widget_scenes: CustomWidgetSceneMap = HashMap::new();
-    #[cfg(feature = "custom-widget")]
-    build_custom_widget_scenes(&mut custom_widget_scenes, doc, scene, scale);
-
-    let generator = BlitzDomPainter::new(
-        doc,
-        scale,
-        width,
-        height,
-        x_offset as f64,
-        y_offset as f64,
-        &custom_widget_scenes,
-    );
-    generator.paint_scene(scene);
+    let generator =
+        BlitzDomPainter::new(doc, scale, width, height, x_offset as f64, y_offset as f64);
+    // acrender: the painter records into a Scene (fragments are cut from it): record, then replay into `scene`
+    let mut recorded = Scene::new();
+    generator.paint_scene(&mut recorded);
+    scene.append_scene(recorded, kurbo::Affine::IDENTITY);
 
     // println!(
     //     "Rendered using {} clips (depth: {}) (wanted: {})",
@@ -77,67 +66,77 @@ pub fn paint_scene(
     // );
 }
 
-#[cfg(feature = "custom-widget")]
-fn build_custom_widget_scenes(
-    custom_widget_scenes: &mut CustomWidgetSceneMap,
+/// acrender: [`paint_scene`] through the fragment cache: only fragments whose inputs changed since
+/// the last frame are re-recorded (see `cache`). Elements are culled to the viewport only (not to
+/// ancestor scrollports). The frame is `scene` (what is painted outside fragments, first) followed
+/// by `pieces`, slices of the cached fragments. `pinned` elements (and their subtrees) are left out
+/// of the frame and returned on their own, as slices placed in the document: each is a fragment of
+/// its own even when it is not a boundary (the cache is to be cleared when the set changes).
+#[allow(clippy::too_many_arguments)]
+pub fn paint_scene_cached(
+    scene: &mut Scene,
+    pieces: &mut Vec<Piece>,
     doc: &mut BaseDocument,
-    render_ctx: &mut impl anyrender::RenderContext,
-    scale: f64,
-) {
-    let doc_id = doc.id();
-
-    // Process scenes for every custom widget in the document
-    let custom_widget_node_ids = doc.custom_widget_node_ids();
-    for node_id in custom_widget_node_ids.into_iter() {
-        if let Some(scene) = process_custom_widget_node(doc, render_ctx, node_id, scale) {
-            custom_widget_scenes.insert((doc_id, node_id), scene);
-        }
-    }
-
-    // Recurse into sub documents
-    let sub_document_node_ids = doc.sub_document_node_ids();
-    for node_id in sub_document_node_ids.into_iter() {
-        if let Some(sub_doc) = doc.get_node_mut(node_id).and_then(|node| node.subdoc_mut()) {
-            let mut inner = sub_doc.inner_mut();
-            build_custom_widget_scenes(custom_widget_scenes, &mut inner, render_ctx, scale);
-        }
-    }
+    (scale, width, height): (f64, u32, u32),
+    cache: &mut PaintCache,
+    canvas: bool,
+    pinned: &HashSet<NodeId>,
+) -> Vec<(NodeId, Vec<Piece>)> {
+    let cell = std::cell::RefCell::new(std::mem::take(cache));
+    let painted = paint_viewport(
+        scene,
+        doc,
+        (scale, width, height),
+        Some(&cell),
+        canvas,
+        pinned,
+    );
+    *cache = cell.into_inner();
+    *pieces = painted.0;
+    painted.1
 }
 
-#[cfg(feature = "custom-widget")]
-fn process_custom_widget_node(
+/// acrender: [`paint_scene`] without the cache, culling like it does: what [`paint_scene_cached`] must
+/// reproduce (its verify mode compares the two).
+pub fn paint_scene_reference(
+    scene: &mut Scene,
     doc: &mut BaseDocument,
-    render_ctx: &mut impl anyrender::RenderContext,
+    (scale, width, height): (f64, u32, u32),
+    canvas: bool,
+    pinned: &HashSet<NodeId>,
+) {
+    paint_viewport(scene, doc, (scale, width, height), None, canvas, pinned);
+}
+
+/// acrender: what [`paint_scene_cached`] and [`paint_scene_reference`] share
+#[allow(clippy::type_complexity)]
+fn paint_viewport(
+    scene: &mut Scene,
+    doc: &mut BaseDocument,
+    (scale, width, height): (f64, u32, u32),
+    cache: Option<&std::cell::RefCell<PaintCache>>,
+    canvas: bool,
+    pinned: &HashSet<NodeId>,
+) -> (Vec<Piece>, Vec<(NodeId, Vec<Piece>)>) {
+    let mut painter = BlitzDomPainter::new(doc, scale, width, height, 0.0, 0.0);
+    painter.cache = cache;
+    painter.canvas = canvas;
+    painter.scrollport_cull = false;
+    painter.pinned = pinned.clone();
+    painter.paint_scene(scene);
+    (painter.pieces.take(), painter.pinned_pieces.take())
+}
+
+/// acrender: paints one element and its subtree (e.g. for a drag image), see
+/// [`BlitzDomPainter::paint_element`].
+pub fn paint_element(
+    scene: &mut Scene,
+    doc: &BaseDocument,
     node_id: NodeId,
     scale: f64,
-) -> Option<Scene> {
-    use blitz_dom::node::{CustomWidgetStatus, ProxyRenderContext};
-
-    let node = doc.get_node_mut(node_id)?;
-    let width = (node.final_layout().size.width as f64 * scale) as u32;
-    let height = (node.final_layout().size.height as f64 * scale) as u32;
-
-    if width == 0 || height == 0 {
-        return None;
-    }
-
-    let style = (*node.stylo_element_data().primary_styles()?).clone();
-    let element = node.data.downcast_element_mut()?;
-    let widget_data = element.custom_widget_data_mut()?;
-
-    let mut render_ctx = ProxyRenderContext {
-        inner: render_ctx,
-        resource_ids: &mut widget_data.active_resource_ids,
-    };
-
-    if widget_data.status == CustomWidgetStatus::Suspended {
-        widget_data.widget.can_create_surfaces(&mut render_ctx);
-        widget_data.status = CustomWidgetStatus::Active;
-    }
-
-    let widget_scene = widget_data
-        .widget
-        .paint(&mut render_ctx, &style, width, height, scale);
-
-    Some(widget_scene)
+    transform: kurbo::Affine,
+) {
+    let (width, height) = doc.viewport().window_size;
+    BlitzDomPainter::new(doc, scale, width, height, 0.0, 0.0)
+        .paint_element(scene, node_id, transform);
 }

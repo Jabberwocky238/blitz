@@ -68,6 +68,25 @@ use style::values::computed::text::TextAlign as StyloTextAlign;
 
 impl crate::document::BaseDocument {
     pub fn resolve_stylist(&mut self, now: f64) {
+        // acrender: Stylo (servo) only marks a removed animation/transition as Canceled; the element keeps
+        // the animated value in its computed style until something else restyles it (upstream: a dot
+        // with `animation: pulse` stayed in its keyframe's box-shadow after `animation: none`).
+        // Restyle those elements once more, now that the canceled entries are gone from the set.
+        let canceled = self.resolve_stylist_pass(now);
+        let canceled: Vec<NodeId> = canceled
+            .into_iter()
+            .filter(|id| self.nodes.get(*id).is_some())
+            .collect();
+        if !canceled.is_empty() {
+            for id in canceled {
+                self.nodes[id].set_restyle_hint(RestyleHint::RESTYLE_SELF);
+            }
+            self.resolve_stylist_pass(now);
+        }
+    }
+
+    /// One style traversal; returns the elements whose animations or transitions were canceled in it
+    fn resolve_stylist_pass(&mut self, now: f64) -> Vec<NodeId> {
         style::thread_state::enter(ThreadState::LAYOUT);
 
         let guard = &self.guard;
@@ -165,6 +184,12 @@ impl crate::document::BaseDocument {
             style::driver::traverse_dom(&traverser, token, rayon_pool);
             nodes_needing_style_image_flush =
                 std::mem::take(traverser.nodes_needing_style_image_flush.get_mut().unwrap());
+            // acrender: new containers start with no size, so resolve_containers restyles them once laid out
+            for id in std::mem::take(traverser.containers.get_mut().unwrap()) {
+                self.container_sizes
+                    .entry(id)
+                    .or_insert((f32::NAN, f32::NAN));
+            }
         }
         self.pending_style_image_nodes
             .extend(nodes_needing_style_image_flush);
@@ -178,6 +203,20 @@ impl crate::document::BaseDocument {
         self.snapshots.clear();
 
         let mut sets = self.animations.sets.write();
+        // acrender: remember them before clear_canceled_animations drops them (see resolve_stylist)
+        let canceled: Vec<NodeId> = sets
+            .iter()
+            .filter(|(_, set)| {
+                set.animations
+                    .iter()
+                    .any(|a| a.state == AnimationState::Canceled)
+                    || set
+                        .transitions
+                        .iter()
+                        .any(|t| t.state == AnimationState::Canceled)
+            })
+            .map(|(key, _)| NodeId::from_u64(key.node.id() as u64))
+            .collect();
         for set in sets.values_mut() {
             set.clear_canceled_animations();
             for animation in set.animations.iter_mut() {
@@ -189,11 +228,14 @@ impl crate::document::BaseDocument {
         }
         sets.retain(|_, state| !state.is_empty());
         self.has_active_animations = sets.values().any(|state| state.needs_animation_ticks());
+        drop(sets);
 
         // Maybe run garbage collection. Stylo has internal to determine whether to run or not.
         self.stylist.rule_tree().maybe_gc();
 
         style::thread_state::exit(ThreadState::LAYOUT);
+
+        canceled
     }
 
     /// Compute the style of an element which the regular style traversal
@@ -204,6 +246,28 @@ impl crate::document::BaseDocument {
     /// return their computed values. This resolves the style on demand
     /// (styling any unstyled ancestors along the way) without storing it on the
     /// node. Returns `None` for non-elements and elements outside the document.
+    /// acrender: the `::placeholder` style of a text input, computed on demand (not stored)
+    pub fn placeholder_style(&self, node_id: NodeId) -> Option<Arc<ComputedValues>> {
+        let node = self.nodes.get(node_id)?;
+        let primary = node.primary_styles()?;
+        style::thread_state::enter(ThreadState::LAYOUT);
+        let guards = StylesheetGuards {
+            author: &self.guard.read(),
+            ua_or_user: &self.guard.read(),
+        };
+        let style = self.stylist.lazily_compute_pseudo_element_style(
+            &guards,
+            node,
+            &PseudoElement::Placeholder,
+            RuleInclusion::All,
+            &primary,
+            false,
+            None,
+        );
+        style::thread_state::exit(ThreadState::LAYOUT);
+        style
+    }
+
     pub fn resolve_undisplayed_style(&self, node_id: NodeId) -> Option<Arc<ComputedValues>> {
         let node = self.nodes.get(node_id)?;
         if !node.is_element() || !node.flags.is_in_document() {
@@ -489,7 +553,11 @@ impl selectors::Element for BlitzNode<'_> {
             NonTSPseudoClass::FocusWithin => {
                 self.element_state().contains(ElementState::FOCUS_WITHIN)
             }
-            NonTSPseudoClass::FocusVisible => false,
+            // acrender: the embedder decides whether a focus is shown (keyboard vs pointer focus) through
+            // FOCUSRING; set_focus_to sets it with FOCUS
+            NonTSPseudoClass::FocusVisible => {
+                self.element_state().contains(ElementState::FOCUSRING)
+            }
             NonTSPseudoClass::Fullscreen => false,
             NonTSPseudoClass::Hover => self.element_state().contains(ElementState::HOVER),
             NonTSPseudoClass::Indeterminate => false,
@@ -1198,6 +1266,11 @@ impl<'a> TElement for BlitzNode<'a> {
             }
         }
 
+        // acrender: the root element without `lang` gets the document's default language
+        let root = self
+            .parent_node()
+            .is_some_and(|parent| matches!(parent.data, NodeData::Document(_)));
+        let lang = lang.or(root.then(|| self.tree().default_lang.as_deref()).flatten());
         if let Some(lang) = lang {
             push_style(PropertyDeclaration::XLang(XLang(Atom::from(lang))));
         }
@@ -1215,8 +1288,20 @@ impl<'a> TElement for BlitzNode<'a> {
         &self,
         _display: &style::values::specified::Display,
     ) -> euclid::default::Size2D<Option<app_units::Au>> {
-        // FIXME: Implement container queries. For now this effectively disables them without panicking.
-        Default::default()
+        // acrender: the container's content box from the last layout (none before the first one); when
+        // layout then changes it, resolve restyles the container's subtree and lays out again
+        // (BaseDocument::resolve_containers)
+        let layout = self.final_layout();
+        if layout.size.width <= 0.0 && layout.size.height <= 0.0 {
+            return Default::default();
+        }
+        let (b, p) = (layout.border, layout.padding);
+        let width = layout.size.width - b.left - b.right - p.left - p.right;
+        let height = layout.size.height - b.top - b.bottom - p.top - p.bottom;
+        euclid::default::Size2D::new(
+            Some(app_units::Au::from_f32_px(width.max(0.0))),
+            Some(app_units::Au::from_f32_px(height.max(0.0))),
+        )
     }
 
     fn each_custom_state<F>(&self, _callback: F)
@@ -1314,6 +1399,9 @@ pub struct RecalcStyle<'a> {
     /// dedicated storage on the node (see `flush_image_layers_from_style`)
     /// because their style changed during this traversal.
     nodes_needing_style_image_flush: Mutex<Vec<NodeId>>,
+    /// acrender: elements restyled into size containers (`container-type` not `normal`), for
+    /// BaseDocument::resolve_containers (so it only looks at known containers)
+    containers: Mutex<Vec<NodeId>>,
 }
 
 impl<'a> RecalcStyle<'a> {
@@ -1321,6 +1409,7 @@ impl<'a> RecalcStyle<'a> {
         RecalcStyle {
             context,
             nodes_needing_style_image_flush: Mutex::new(Vec::new()),
+            containers: Mutex::new(Vec::new()),
         }
     }
 }
@@ -1341,6 +1430,11 @@ impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
             sync_pseudo_element_styles(el, &data, &self.nodes_needing_style_image_flush);
             if let Some(style) = data.styles.get_primary() {
                 el.record_out_of_flow(style);
+                // acrender: size containers, for @container queries
+                if style.get_box().container_type != style::values::computed::ContainerType::NORMAL
+                {
+                    self.containers.lock().unwrap().push(el.id);
+                }
             }
 
             if !data.damage.is_empty() {

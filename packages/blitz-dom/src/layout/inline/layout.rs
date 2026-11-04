@@ -397,6 +397,18 @@ impl LayoutPassState<'_> {
 
         // Update inline boxes
         for ibox in inline_layout.layout.inline_boxes_mut() {
+            // acrender: a span's edge: as wide as that side's margin + border + padding, no height
+            if let Some(edge) = crate::node::InlineEdge::of(ibox.id) {
+                let style = self.child_layout_style(&self.nodes[edge.node]);
+                let side = |r: taffy::Rect<f32>| if edge.end { r.right } else { r.left };
+                // percentages: of the containing block's width (this inline container's content box)
+                let basis = child_inputs.parent_size;
+                let width = side(style.margin().resolve_or_zero(basis, resolve_calc_value))
+                    + side(style.border().resolve_or_zero(basis, resolve_calc_value))
+                    + side(style.padding().resolve_or_zero(basis, resolve_calc_value));
+                (ibox.width, ibox.height, ibox.baseline) = (width.max(0.0) * scale, 0.0, None);
+                continue;
+            }
             let style = self.child_layout_style(&self.nodes[NodeId::from_u64(ibox.id)]);
             let margin = style
                 .margin()
@@ -503,7 +515,13 @@ impl LayoutPassState<'_> {
                 // This is a little tricky as the size of the inline boxes may depend on whether we are sizing under
                 // and a min-content or max-content constraint. So if we want to compute both widths in one pass then
                 // we need to store both a min-content and max-content size on each box.
-                let content_sizes = inline_layout.layout.calculate_content_widths();
+                // acrender: without inline boxes they only depend on the text and the style, so the
+                // cached widths hold (cleared with the layout cache, see Node::invalidate_layout_cache)
+                let content_sizes = if inline_layout.layout.inline_boxes().len() == 0 {
+                    inline_layout.content_widths()
+                } else {
+                    inline_layout.layout.calculate_content_widths()
+                };
                 let min_content_width = content_sizes.min;
                 let max_content_width = content_sizes.max;
 
@@ -513,6 +531,9 @@ impl LayoutPassState<'_> {
                     AvailableSpace::MinContent => {
                         let mut width: f32 = 0.0;
                         for ibox in inline_layout.layout.inline_boxes_mut() {
+                            if crate::node::InlineEdge::of(ibox.id).is_some() {
+                                continue;
+                            }
                             let (is_floated, margin) = {
                                 let style =
                                     self.child_layout_style(&self.nodes[NodeId::from_u64(ibox.id)]);
@@ -548,6 +569,9 @@ impl LayoutPassState<'_> {
                         let mut right_band: f32 = 0.0;
                         let mut width: f32 = 0.0;
                         for ibox in inline_layout.layout.inline_boxes_mut() {
+                            if crate::node::InlineEdge::of(ibox.id).is_some() {
+                                continue;
+                            }
                             let (float, clear, margin) = {
                                 let style =
                                     self.child_layout_style(&self.nodes[NodeId::from_u64(ibox.id)]);
@@ -665,7 +689,10 @@ impl LayoutPassState<'_> {
 
         #[cfg(not(feature = "floats"))]
         {
-            inline_layout.layout.break_all_lines(Some(width));
+            // acrender: a shrink-to-fit box measured its max-content width, but the known width it is laid out at
+            // comes back through percentages / padding sums in f32 (82.2 - 60.2 = 21.999998 for 22px of text):
+            // the last word then wraps. Breaking only needs to tolerate that rounding, not any real overflow.
+            inline_layout.layout.break_all_lines(Some(width + 0.01));
         }
 
         // Out-of-flow candidates bubbled up from this container and its in-flow subtree.
@@ -679,8 +706,12 @@ impl LayoutPassState<'_> {
             let initial_slot = block_ctx.find_content_slot(0.0, Clear::None, None);
             let mut has_active_floats = initial_slot.segment_id.is_some();
             let state = breaker.state_mut();
-            state.set_layout_max_advance(width);
-            state.set_line_max_advance(initial_slot.width * scale);
+            // acrender: the same f32 slack as without floats (see `break_all_lines` below the cfg)
+            state.set_layout_max_advance(width + 0.01);
+            state.set_line_max_advance(match has_active_floats {
+                true => initial_slot.width * scale,
+                false => width + 0.01,
+            });
             state.set_line_x(initial_slot.x * scale);
             state.set_line_y((initial_slot.y * scale) as f64);
 
@@ -710,7 +741,7 @@ impl LayoutPassState<'_> {
                             state.set_line_y((next_slot.y * scale) as f64);
                         } else {
                             state.set_line_x(0.0);
-                            state.set_line_max_advance(width);
+                            state.set_line_max_advance(width + 0.01);
                         }
 
                         continue;
@@ -825,6 +856,7 @@ impl LayoutPassState<'_> {
             })
             .unwrap_or((parley::layout::Alignment::Start, None));
 
+        inline_layout.generation = self.nodes.next_text_generation(); // acrender: see TextLayout::generation
         inline_layout.layout.align(
             alignment,
             AlignmentOptions {
@@ -869,6 +901,16 @@ impl LayoutPassState<'_> {
             if is_bfc_root {
                 height = height.max(float_height_contribution * scale)
             };
+        }
+
+        // acrender: `-webkit-line-clamp`: the box ends after its N-th line
+        inline_layout.clamp = crate::webkit_compat::line_clamp(&self.nodes, node_id)
+            .filter(|&n| inline_layout.layout.len() > n);
+        if let Some(line) = inline_layout
+            .clamp
+            .and_then(|n| inline_layout.layout.get(n - 1))
+        {
+            height = line.metrics().block_max_coord;
         }
 
         // Note: `width` and `height` are content-box measurements of the inline content.
@@ -923,6 +965,9 @@ impl LayoutPassState<'_> {
         for line in inline_layout.layout.lines() {
             for item in line.items() {
                 if let parley::layout::PositionedLayoutItem::InlineBox(ibox) = item {
+                    if crate::node::InlineEdge::of(ibox.id).is_some() {
+                        continue;
+                    }
                     let order = ibox_order;
                     ibox_order += 1;
                     if inputs.run_mode == RunMode::PerformLayout {

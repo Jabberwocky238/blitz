@@ -337,6 +337,7 @@ impl BaseDocument {
             shell_provider: self.shell_provider.clone(),
             abort_signal: self.abort_signal.clone(),
             import_depth: 0,
+            font_sources: self.font_sources.clone(),
         }
     }
 
@@ -522,6 +523,7 @@ impl BaseDocument {
                 &self.shell_provider,
                 &guard,
                 self.abort_signal.as_ref(),
+                &self.font_sources,
             );
         }
         let (change_kind, ancestors) = match &list {
@@ -947,7 +949,7 @@ impl BaseDocument {
             return Err(CssomError::NotSupported);
         };
         let new_block = style::properties::declaration_block::parse_style_attribute(
-            css,
+            &crate::webkit_compat::webkit_compat(css), // acrender
             &self.url.url_extra_data(),
             None,
             QuirksMode::NoQuirks,

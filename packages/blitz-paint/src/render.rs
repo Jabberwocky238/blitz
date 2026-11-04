@@ -6,25 +6,29 @@ mod form_controls;
 mod mask;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::kurbo_css::CssBox;
-use crate::color::{Color, ToColorColor};
-use crate::debug_overlay::render_debug_overlay;
+use crate::cache::{Builder, PaintCache, Piece, Ref, Run};
+use crate::color::ToColorColor;
+// acrender: the scrollbar thumbs (feature `scrollbars`, on in acde-base) need these
+use crate::SELECTION_COLOR;
+#[cfg(feature = "scrollbars")]
+use crate::color::Color;
 use crate::filters::convert_filters;
 use crate::kurbo_css::NonUniformRoundedRectRadii;
-use crate::layers::LayerManager;
+use crate::layers;
 use crate::sizing::compute_object_fit;
 use crate::text::DrawTextContext;
-use crate::{CustomWidgetSceneMap, SELECTION_COLOR};
-use anyrender::{PaintScene, Scene};
+use acgpu::{PaintScene, Scene};
 use blitz_dom::node::{
     ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextInputData,
-    TextNodeData,
+    TextLayout, TextNodeData,
 };
 use blitz_dom::{BaseDocument, ElementData, Node, NodeId, local_name};
-use blitz_traits::devtools::DevtoolSettings;
+#[cfg(feature = "scrollbars")]
+use kurbo::Stroke;
 
 use style::values::computed::{BorderCornerRadius, ColorOrAuto};
 use style::{
@@ -40,9 +44,8 @@ use style::{
     },
 };
 
-use kurbo::{self, Affine, Insets, Point, Rect, Shape, Size, Stroke, Vec2};
+use kurbo::{self, Affine, Insets, Point, Rect, Size, Vec2};
 use peniko::{self, Fill, ImageData, ImageSampler};
-use style::values::generics::color::GenericColor;
 use taffy::Layout;
 
 /// A view of the track positions reported by taffy in physical (left-to-right /
@@ -101,6 +104,11 @@ impl<'a> PhysicalTracks<'a> {
     }
 }
 
+/// acrender: `command` with `transform` applied on top of its own
+pub fn placed(command: acgpu::RenderCommand, transform: Affine) -> acgpu::RenderCommand {
+    command.transformed(transform)
+}
+
 /// A short-lived struct which holds a bunch of parameters for rendering a scene so
 /// that we don't have to pass them down as parameters
 pub struct BlitzDomPainter<'dom, 'a> {
@@ -118,14 +126,27 @@ pub struct BlitzDomPainter<'dom, 'a> {
     pub(crate) hovered_scrollbar: Option<blitz_dom::node::ScrollbarRef>,
     #[cfg(feature = "scrollbars")]
     pub(crate) scrollbar_drag_target: Option<blitz_dom::node::ScrollbarRef>,
-    pub(crate) layer_manager: LayerManager,
     /// Reusable scratch allocations shared by all text layouts painted for this document.
     pub(crate) draw_text_context: RefCell<DrawTextContext>,
     /// Cached selection ranges for O(1) lookup: node_id -> (start_offset, end_offset)
     pub(crate) selection_ranges: HashMap<NodeId, (usize, usize)>,
 
-    // Pre-computed `Scene`s for each CustomWidget
-    pub(crate) custom_widget_scenes: &'a CustomWidgetSceneMap,
+    /// acrender: fragment cache (see `cache`); `None` paints uncached
+    pub(crate) cache: Option<&'a RefCell<PaintCache>>,
+    /// acrender: fragments being recorded, innermost last
+    pub(crate) recording: RefCell<Vec<Builder>>,
+    /// acrender: the element whose background is painted as the canvas background (and not again)
+    pub(crate) canvas_background: Option<NodeId>,
+    /// acrender: narrow the cull rectangle to ancestor scrollports (off for cached / reference painting)
+    pub(crate) scrollport_cull: bool,
+    /// acrender: paint the canvas background (the part that goes at the bottom)
+    pub(crate) canvas: bool,
+    /// acrender: the cached paint's frame, as slices of the fragments (see `flatten`)
+    pub(crate) pieces: RefCell<Vec<Piece>>,
+    /// acrender: elements painted on their own, not in the frame (see `paint_scene_cached`)
+    pub(crate) pinned: HashSet<NodeId>,
+    /// acrender: each pinned element's slices, at its placement in the document
+    pub(crate) pinned_pieces: RefCell<Vec<(NodeId, Vec<Piece>)>>,
 }
 
 impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
@@ -137,7 +158,6 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         height: u32,
         initial_x: f64,
         initial_y: f64,
-        custom_widget_scenes: &'a CustomWidgetSceneMap,
     ) -> Self {
         let selection_ranges: HashMap<NodeId, (usize, usize)> = dom
             .get_text_selection_ranges()
@@ -145,7 +165,6 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             .map(|(node_id, start, end)| (node_id, (start, end)))
             .collect();
 
-        let layer_manager = LayerManager::default();
         let root_element_id = dom.try_root_element().map(|el| el.id);
 
         Self {
@@ -160,10 +179,16 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             hovered_scrollbar: dom.hovered_scrollbar(),
             #[cfg(feature = "scrollbars")]
             scrollbar_drag_target: dom.scrollbar_drag_target(),
-            layer_manager,
             draw_text_context: RefCell::new(DrawTextContext::default()),
             selection_ranges,
-            custom_widget_scenes,
+            cache: None,
+            recording: RefCell::new(Vec::new()),
+            canvas_background: Self::canvas_background_node(dom),
+            scrollport_cull: true,
+            canvas: true,
+            pieces: RefCell::new(Vec::new()),
+            pinned: HashSet::new(),
+            pinned_pieces: RefCell::new(Vec::new()),
         }
     }
 
@@ -172,7 +197,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
     ///
     /// This assumes styles are resolved and layout is complete.
     /// Make sure you do those before trying to render
-    pub fn paint_scene(&self, scene: &mut impl PaintScene) {
+    pub fn paint_scene(&self, scene: &mut Scene) {
         if self.dom.has_pending_critical_resources() {
             return;
         }
@@ -187,92 +212,274 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             return;
         };
         let root_id = root_element.id;
-        let bg_width = (self.width as f32).max(root_element.final_layout().size.width);
-        let bg_height = (self.height as f32).max(root_element.final_layout().size.height);
-
-        let background_color = {
-            let html_color = root_element
-                .primary_styles()
-                .map(|s| s.clone_background_color())
-                .unwrap_or(GenericColor::TRANSPARENT_BLACK);
-            if html_color == GenericColor::TRANSPARENT_BLACK {
-                root_element
-                    .children
-                    .iter()
-                    .find_map(|id| {
-                        self.dom
-                            .as_ref()
-                            .get_node(*id)
-                            .filter(|node| node.data.is_element_with_tag_name(&local_name!("body")))
-                    })
-                    .and_then(|body| body.primary_styles())
-                    .map(|style| {
-                        let current_color = style.clone_color();
-                        style
-                            .clone_background_color()
-                            .resolve_to_absolute(&current_color)
-                    })
-            } else {
-                let current_color = root_element.primary_styles().unwrap().clone_color();
-                Some(html_color.resolve_to_absolute(&current_color))
-            }
-        };
-
-        if let Some(bg_color) = background_color {
-            let bg_color = bg_color.as_srgb_color();
-            let rect = Rect::from_origin_size(
-                (self.initial_x, self.initial_y),
-                (bg_width as f64, bg_height as f64),
-            );
-            scene.fill(Fill::NonZero, Affine::IDENTITY, bg_color, None, &rect);
-        }
-
         // The root clip rectangle is the viewport (in screen coordinates, with the
         // initial offset already subtracted). Elements outside of this are culled, and
         // scrollports narrow this rectangle further for their descendants.
-        let viewport_clip_rect = Rect::new(0.0, 0.0, self.width as f64, self.height as f64);
+        let viewport_clip_rect = self.viewport();
+        let root_transform = Affine::translate(Vec2 {
+            x: self.initial_x - (viewport_scroll.x * self.scale),
+            y: self.initial_y - (viewport_scroll.y * self.scale),
+        });
+        if self.canvas {
+            self.draw_canvas_background(scene, root_transform);
+        }
 
+        // acrender: cached painting flattens the root fragment instead
+        match self.cache {
+            Some(cache) => {
+                // the canvas background's element doesn't paint its own background: a fragment
+                // recorded for another one is wrong
+                let key = format!(
+                    "{} {:?} {:?} {} {:?}",
+                    self.scale,
+                    self.hovered_scrollbar_key(),
+                    self.drag_target_key(),
+                    self.canvas,
+                    self.canvas_background,
+                );
+                cache.borrow_mut().begin(key);
+                let root = &self.dom.as_ref().tree()[root_id];
+                let place = PaintCache::place(root, root_transform, self.scale);
+                self.ensure(cache, root_id, place);
+                let mut runs = Vec::new();
+                let mut pieces = self.pieces.borrow_mut();
+                let mut start = scene.commands.len();
+                let mut deferred = Vec::new();
+                Self::flatten(
+                    &cache.borrow(),
+                    self.dom,
+                    (&mut pieces, &mut start),
+                    (&mut runs, (&self.pinned, &mut deferred)),
+                    root_id,
+                    place,
+                    self.scale,
+                );
+                let mut pinned = self.pinned_pieces.borrow_mut();
+                while let Some((node, place)) = deferred.pop() {
+                    let (mut own, mut at) = (Vec::new(), 0);
+                    Self::flatten(
+                        &cache.borrow(),
+                        self.dom,
+                        (&mut own, &mut at),
+                        (&mut Vec::new(), (&self.pinned, &mut deferred)),
+                        node,
+                        place,
+                        self.scale,
+                    );
+                    pinned.push((node, own));
+                }
+                let mut cache = cache.borrow_mut();
+                for (run, place) in runs {
+                    cache.ran(run, place);
+                }
+                cache.end(self.dom);
+            }
+            None => self.render_element(scene, root_id, root_transform, viewport_clip_rect),
+        }
+        // acrender: no devtools overlays (layout highlight, hovered / selected node)
+    }
+
+    /// The viewport in screen coordinates (the initial offset already subtracted)
+    fn viewport(&self) -> Rect {
+        Rect::new(0.0, 0.0, self.width as f64, self.height as f64)
+    }
+
+    #[cfg(feature = "scrollbars")]
+    fn hovered_scrollbar_key(&self) -> Option<blitz_dom::node::ScrollbarRef> {
+        self.hovered_scrollbar
+    }
+    #[cfg(not(feature = "scrollbars"))]
+    fn hovered_scrollbar_key(&self) -> Option<()> {
+        None
+    }
+    #[cfg(feature = "scrollbars")]
+    fn drag_target_key(&self) -> Option<blitz_dom::node::ScrollbarRef> {
+        self.scrollbar_drag_target
+    }
+    #[cfg(not(feature = "scrollbars"))]
+    fn drag_target_key(&self) -> Option<()> {
+        None
+    }
+
+    /// acrender: the element whose background is the canvas's (CSS Backgrounds 3 §2.11.2): the root
+    /// element when it has a background (a color or an image layer), else its <body>.
+    fn canvas_background_node(dom: &BaseDocument) -> Option<NodeId> {
+        let has_background = |node: &Node| {
+            node.primary_styles().is_some_and(|s| {
+                let bg = s.get_background();
+                let color = s
+                    .clone_background_color()
+                    .resolve_to_absolute(&s.clone_color());
+                color.alpha > 0.0
+                    || bg
+                        .background_image
+                        .0
+                        .iter()
+                        .any(|i| !matches!(i, style::values::computed::image::Image::None))
+            })
+        };
+        let root = dom.try_root_element()?;
+        if has_background(root) {
+            return Some(root.id);
+        }
+        root.children
+            .iter()
+            .filter_map(|id| dom.get_node(*id))
+            .find(|n| n.data.is_element_with_tag_name(&local_name!("body")))
+            .filter(|body| has_background(body))
+            .map(|body| body.id)
+    }
+
+    /// acrender: paints the canvas background: the whole background (color and image layers) of the
+    /// root / <body> (see canvas_background_node), over the whole canvas (at least the viewport),
+    /// positioned against it. Upstream filled only the background color, so a gradient or image on
+    /// html / body only covered that element's own box.
+    fn draw_canvas_background(&self, scene: &mut Scene, root_transform: Affine) {
+        let Some(node) = self.canvas_background.and_then(|id| self.dom.get_node(id)) else {
+            return;
+        };
+        let root = self.dom.try_root_element().map_or(Size::ZERO, |r| {
+            let s = r.final_layout().size;
+            Size::new(s.width as f64, s.height as f64)
+        });
+        // positioned against the root element's box, painting the whole canvas (at least the viewport)
+        let Some(root_element) = self.dom.try_root_element() else {
+            return;
+        };
+        let mut layout = *root_element.final_layout();
+        layout.location = taffy::Point::ZERO;
+        let canvas = Rect::new(
+            0.0,
+            0.0,
+            (self.width as f64).max(root.width * self.scale),
+            (self.height as f64).max(root.height * self.scale),
+        );
+        let mut cx = self.element_cx(node, layout, root_transform);
+        cx.canvas = Some(canvas);
+        cx.draw_background(scene);
+    }
+
+    /// acrender: records `node_id`'s fragment in its local space (border box at the origin, before
+    /// its own transform); boundary children inside it become references
+    fn record(&self, cache: &RefCell<PaintCache>, node_id: NodeId, placement: Affine) {
+        let location = self.dom.as_ref().tree()[node_id].final_layout().location;
+        let origin = Vec2::new(location.x as f64, location.y as f64) * self.scale;
+        let viewport = self.viewport();
+        self.recording
+            .borrow_mut()
+            .push(Builder::new(node_id, placement));
+        let mut scene = Scene::new();
+        self.render_element(&mut scene, node_id, Affine::translate(-origin), viewport);
+        let builder = self.recording.borrow_mut().pop().expect("recording stack");
+        cache.borrow_mut().store(node_id, scene, builder, self.dom);
+    }
+
+    /// acrender: makes `node_id`'s fragment current (reused or re-recorded) for `placement` (its
+    /// local space → the scene), then those it references
+    fn ensure(&self, cache: &RefCell<PaintCache>, node_id: NodeId, placement: Affine) {
+        if !cache.borrow_mut().reuse(
+            self.dom,
+            node_id,
+            (&self.selection_ranges, &self.pinned),
+            placement,
+            self.viewport(),
+        ) {
+            self.record(cache, node_id, placement);
+        }
+        // By index, not a copy of the list: ensuring a child stores only the child's fragment
+        let at = |i: usize| {
+            cache
+                .borrow()
+                .get(node_id)
+                .and_then(|f| f.refs.get(i).copied())
+        };
+        for r in (0..).map_while(at) {
+            if let Some(child) = self.dom.get_node(r.node) {
+                self.ensure(
+                    cache,
+                    r.node,
+                    placement * PaintCache::place(child, r.transform, self.scale),
+                );
+            }
+        }
+    }
+
+    /// acrender: appends `node_id`'s fragment to `out` with `transform`, its references in place;
+    /// `runs` gets each run of commands appended, with the fragment's placement. A pinned reference
+    /// is not appended: it goes to `deferred` with its placement.
+    #[allow(clippy::type_complexity)]
+    fn flatten(
+        cache: &PaintCache,
+        dom: &BaseDocument,
+        out: (&mut Vec<Piece>, &mut usize),
+        (runs, (pinned, deferred)): (
+            &mut Vec<(Run, Affine)>,
+            (&HashSet<NodeId>, &mut Vec<(NodeId, Affine)>),
+        ),
+        node_id: NodeId,
+        transform: Affine,
+        scale: f64,
+    ) {
+        let Some(fragment) = cache.get(node_id) else {
+            return;
+        };
+        let (pieces, at) = out;
+        let piece = |pieces: &mut Vec<Piece>,
+                     at: &mut usize,
+                     runs: &mut Vec<(Run, Affine)>,
+                     range: std::ops::Range<usize>| {
+            let run = Run {
+                start: *at,
+                len: range.len(),
+                node: node_id,
+                local: range.start,
+            };
+            runs.push((run, transform));
+            *at += range.len();
+            if !range.is_empty() {
+                pieces.push(Piece {
+                    commands: fragment.commands.clone(),
+                    range,
+                    transform,
+                });
+            }
+        };
+        let mut start = 0;
+        for r in &fragment.refs {
+            piece(pieces, at, runs, start..r.at);
+            start = r.at;
+            if let Some(child) = dom.get_node(r.node) {
+                let place = transform * PaintCache::place(child, r.transform, scale);
+                match pinned.contains(&r.node) {
+                    true => deferred.push((r.node, place)),
+                    false => Self::flatten(
+                        cache,
+                        dom,
+                        (pieces, at),
+                        (runs, (pinned, deferred)),
+                        r.node,
+                        place,
+                        scale,
+                    ),
+                }
+            }
+        }
+        piece(pieces, at, runs, start..fragment.commands.len());
+    }
+
+    /// acrender: paints just the element `node_id` and its subtree, without the document background
+    /// or its ancestors' transforms, opacity and clips: `transform` maps the element's border box
+    /// (at the origin, in physical pixels) into `scene`; the element's own transform still applies.
+    pub fn paint_element(&self, scene: &mut Scene, node_id: NodeId, transform: Affine) {
+        let location = self.dom.as_ref().tree()[node_id].final_layout().location;
+        let origin = Vec2::new(location.x as f64, location.y as f64) * self.scale;
+        let everywhere = Rect::new(-1e9, -1e9, 1e9, 1e9);
         self.render_element(
             scene,
-            root_id,
-            Affine::translate(Vec2 {
-                x: self.initial_x - (viewport_scroll.x * self.scale),
-                y: self.initial_y - (viewport_scroll.y * self.scale),
-            }),
-            viewport_clip_rect,
+            node_id,
+            transform * Affine::translate(-origin),
+            everywhere,
         );
-
-        // Render debug overlay
-        if self.dom.devtools().highlight_hover {
-            if let Some(node_id) = self.dom.as_ref().get_hover_node_id() {
-                render_debug_overlay(
-                    scene,
-                    self.dom,
-                    node_id,
-                    self.scale,
-                    self.initial_x,
-                    self.initial_y,
-                );
-            }
-        }
-        if let Some(node_id) = self.dom.devtools().highlight_node {
-            // Only nodes with element data have a layout to visualise
-            if self
-                .dom
-                .as_ref()
-                .get_node(node_id)
-                .is_some_and(|node| node.element_data().is_some())
-            {
-                render_debug_overlay(
-                    scene,
-                    self.dom,
-                    node_id,
-                    self.scale,
-                    self.initial_x,
-                    self.initial_y,
-                );
-            }
-        }
     }
 
     /// Renders a node, but is guaranteed that the node is an element
@@ -286,12 +493,42 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
     /// to traverse back to the parent for its styles, or needing to pass down styles
     fn render_element(
         &self,
-        scene: &mut impl PaintScene,
+        scene: &mut Scene,
         node_id: NodeId,
         parent_style_transform: Affine,
         clip_rect: Rect,
     ) {
         let node = &self.dom.as_ref().tree()[node_id];
+
+        // acrender: while recording a fragment, a boundary child becomes a reference (it gets its own
+        // fragment) and every other element is noted as one this fragment depends on
+        let recording = self.recording.borrow().last().map(|b| b.node);
+        if recording.is_none() && self.pinned.contains(&node_id) {
+            return;
+        }
+        if let Some(root) = recording {
+            if root != node_id && (PaintCache::is_boundary(node) || self.pinned.contains(&node_id))
+            {
+                let r = Ref {
+                    at: scene.commands.len(),
+                    node: node_id,
+                    transform: parent_style_transform,
+                };
+                self.recording
+                    .borrow_mut()
+                    .last_mut()
+                    .expect("recording")
+                    .refs
+                    .push(r);
+                return;
+            }
+            let selection = self.selection_ranges.get(&node_id).copied();
+            self.recording
+                .borrow_mut()
+                .last_mut()
+                .expect("recording")
+                .visit(self.dom, node, selection);
+        }
 
         // Early return if the element is hidden
         if matches!(node.taffy_display(), taffy::Display::None) {
@@ -367,7 +604,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         } = *node.final_layout();
         let box_position = Vec2::new(location.x as f64, location.y as f64) * self.scale;
         let box_size = Size::new(size.width as f64, size.height as f64);
-        let border_box = Rect::from_origin_size(box_position.to_point(), box_size);
+        // acrender: in the element's own space, like `overflow` (upstream placed it at
+        // `box_position`, unscaled, which `transform` translates by again: the culling and fragment
+        // bounds grew by the element's position, so a moved fragment never looked in view)
+        let border_box = Rect::from_origin_size(Point::ZERO, box_size * self.scale);
         let scaled_pb = (padding + border).map(f64::from);
         let content_position = kurbo::Point {
             x: scaled_pb.left,
@@ -384,20 +624,34 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             * Affine::translate(box_position)
             * node.transform().as_deref().copied().unwrap_or_default();
 
+        // acrender: while recording a fragment `transform` is in the fragment's local space; its
+        // placement on screen (where this frame puts it) maps it back for culling
+        let placement = self
+            .recording
+            .borrow()
+            .last()
+            .map_or(Affine::IDENTITY, |b| b.placement);
         let screen_transform = Affine::translate(Vec2 {
             x: -self.initial_x,
             y: -self.initial_y,
-        }) * transform;
+        }) * placement
+            * transform;
         let screen_bbox = screen_transform.transform_rect_bbox(overflow.union(border_box));
 
         // Cull elements that fall entirely outside the current clip rectangle. In addition to
         // the viewport, `clip_rect` is narrowed by any ancestor scrollport (see below), so this
         // also culls elements scrolled out of view inside a clipping/scrolling container.
-        if screen_bbox.x1 < clip_rect.x0
+        let culled = screen_bbox.x1 < clip_rect.x0
             || screen_bbox.x0 > clip_rect.x1
             || screen_bbox.y1 < clip_rect.y0
-            || screen_bbox.y0 > clip_rect.y1
-        {
+            || screen_bbox.y0 > clip_rect.y1;
+        if let Some(b) = self.recording.borrow_mut().last_mut() {
+            b.painted(
+                culled.then_some(overflow),
+                transform.transform_rect_bbox(overflow.union(border_box)),
+            );
+        }
+        if culled {
             return;
         }
 
@@ -426,36 +680,33 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             return;
         }
 
-        #[cfg(feature = "custom-widget")]
-        let custom_widget_scene = self.custom_widget_scenes.get(&(self.dom.id(), node_id));
-        #[cfg(not(feature = "custom-widget"))]
-        let custom_widget_scene = None;
-
         // Apply CSS transform property (where transforms are 2d)
 
-        let mut cx = self.element_cx(node, *node.final_layout(), transform, custom_widget_scene);
+        let mut cx = self.element_cx(node, *node.final_layout(), transform);
 
         // If this element clips its overflow it establishes a scrollport: narrow the clip
         // rectangle passed to descendants to the visible (clipped) region so that content
         // scrolled out of view is culled rather than drawn and clipped away. The box used
         // here matches the clip applied to the content below.
-        let child_clip_rect = if should_clip {
+        // acrender: cached and reference painting cull against the viewport only (a fragment is reused
+        // wherever it lands, not just inside the scrollport it was recorded in)
+        let child_clip_rect = if should_clip && self.scrollport_cull {
+            // acrender: the box's rect (the bounding box of its path)
             let clip_box = if is_text_input {
-                cx.frame.content_box_path()
+                cx.frame.content_box
             } else {
-                cx.frame.padding_box_path()
+                cx.frame.padding_box
             };
-            clip_rect.intersect(screen_transform.transform_rect_bbox(clip_box.bounding_box()))
+            clip_rect.intersect(screen_transform.transform_rect_bbox(clip_box))
         } else {
             clip_rect
         };
 
         // Compute clip-path (if any) and wrap all rendering in a clip layer
-        let clip_path_shape = cx.clip_path_shape();
-        let has_clip_path = clip_path_shape.is_some();
-        let default_clip = cx.frame.border_box_path();
-        let mut clip_path_for_layer = clip_path_shape.unwrap_or(default_clip);
-        clip_path_for_layer.apply_affine(Affine::scale(self.scale));
+        let clip_path_for_layer = cx.clip_path_shape().map(|mut path| {
+            path.apply_affine(Affine::scale(self.scale));
+            path
+        });
 
         // CSS 2 `clip` property (absolutely positioned elements only). Applies to the whole of
         // the element's rendering (including outlines and shadows), so it is the outermost layer.
@@ -463,26 +714,20 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         if css_clip_rect.is_some_and(|rect| rect.is_zero_area()) {
             return;
         }
-        let css_clip_layer_pushed = self.layer_manager.maybe_push_layer(
-            scene,
-            css_clip_rect.is_some(),
-            1.0,
-            cx.transform,
-            &css_clip_rect.unwrap_or(Rect::ZERO),
-            None,
-            None,
-        );
+        if let Some(rect) = &css_clip_rect {
+            layers::push_layer(scene, rect, 1.0, cx.transform, None, None);
+        }
 
-        cx.draw_outline(scene);
+        // acrender: the outline is drawn last (below), over the background and content
+        let outline_transform = cx.transform;
         cx.draw_outset_box_shadow(scene);
 
         // clip-path clip ayer
-        self.layer_manager.maybe_with_layer(
+        layers::maybe_with_layer(
             scene,
-            has_clip_path,
+            clip_path_for_layer.as_ref(),
             1.0,
             cx.transform,
-            &clip_path_for_layer,
             None,
             None,
             |scene| {
@@ -506,10 +751,11 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 // - y1: positive bottom expansion
                 let filter_expansion_area = filter
                     .as_ref()
-                    .map(|f| f.expansion_rect())
+                    .map(|f| f.expansion())
                     .unwrap_or(Rect::ZERO);
 
-                let mut effect_layer_clip = cx.frame.border_box_path().bounding_box();
+                // acrender: the border box (the bounding box of its path)
+                let mut effect_layer_clip = cx.frame.border_box;
                 effect_layer_clip.x0 += filter_expansion_area.x0;
                 effect_layer_clip.y0 += filter_expansion_area.y0;
                 effect_layer_clip.x1 += filter_expansion_area.x1;
@@ -517,36 +763,39 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
                 // Opacity/Filter layer if box has opacity or a filter.
                 // Clipped to border-box as it needs to include the background and borders.
-                self.layer_manager.maybe_with_layer(
+                let has_effect = has_opacity || filter.is_some() || backdrop_filter.is_some();
+                layers::maybe_with_layer(
                     scene,
-                    has_opacity || filter.is_some() || backdrop_filter.is_some(),
+                    has_effect.then_some(&effect_layer_clip),
                     opacity,
                     cx.transform,
-                    &effect_layer_clip,
                     filter,
                     backdrop_filter,
                     |scene| {
-                        cx.draw_background(scene);
+                        // acrender: the canvas already has this element's background
+                        if Some(node_id) != self.canvas_background {
+                            cx.draw_background(scene);
+                        }
                         cx.draw_inset_box_shadow(scene);
                         cx.draw_table_row_backgrounds(scene);
                         cx.draw_table_borders(scene);
                         cx.draw_border(scene);
-                        cx.stroke_devtools(scene);
 
                         // TODO: allow layers with opacity to be unclipped (overflow: visible)
-                        let clip = if is_text_input {
-                            &cx.frame.content_box_path()
-                        } else {
-                            &cx.frame.padding_box_path()
-                        };
+                        let clip = should_clip.then(|| {
+                            if is_text_input {
+                                cx.frame.content_box_path()
+                            } else {
+                                cx.frame.padding_box_path()
+                            }
+                        });
 
                         // Clip layer if box requires clipping. Opacity set to 1.0
-                        self.layer_manager.maybe_with_layer(
+                        layers::maybe_with_layer(
                             scene,
-                            should_clip,
+                            clip.as_ref(),
                             1.0, // opacity
                             cx.transform,
-                            clip,
                             None,
                             None,
                             |scene| {
@@ -556,15 +805,15 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                     y: content_position.y - node.scroll_offset().y,
                                 };
 
-                                cx.transform = cx.transform.then_translate(Vec2 {
+                                // acrender: scroll in the element's space (an ancestor's scale applies)
+                                cx.transform = cx.transform.pre_translate(Vec2 {
                                     x: -node.scroll_offset().x * self.scale,
                                     y: -node.scroll_offset().y * self.scale,
                                 });
                                 cx.draw_image(scene);
+                                cx.draw_canvas_picture(scene);
                                 #[cfg(feature = "svg")]
                                 cx.draw_svg(scene);
-                                #[cfg(feature = "custom-widget")]
-                                cx.draw_custom_widget(scene);
                                 cx.draw_sub_document(scene);
                                 cx.draw_input(scene);
                                 cx.draw_text_input_text(scene, content_position);
@@ -590,13 +839,17 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             },
         );
 
-        self.layer_manager
-            .maybe_pop_layer(scene, css_clip_layer_pushed);
+        cx.transform = outline_transform;
+        cx.draw_outline(scene);
+
+        if css_clip_rect.is_some() {
+            scene.pop_layer();
+        }
     }
 
     fn render_node(
         &self,
-        scene: &mut impl PaintScene,
+        scene: &mut Scene,
         node_id: NodeId,
         parent_style_transform: Affine,
         clip_rect: Rect,
@@ -618,12 +871,27 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         }
     }
 
+    /// acrender: one line's piece of an inline element with edges (see blitz-dom `InlineEdge` and
+    /// text.rs): its background and border, drawn like a block's with `frame` as the box (sides and
+    /// corners cut where the element wraps already left out of it)
+    pub(crate) fn draw_inline_fragment(
+        &'dom self,
+        scene: &mut impl PaintScene,
+        node: &'dom Node,
+        frame: CssBox,
+        transform: Affine,
+    ) {
+        let mut cx = self.element_cx(node, Layout::new(), transform);
+        cx.frame = frame;
+        cx.draw_background(scene);
+        cx.draw_border(scene);
+    }
+
     fn element_cx(
         &'dom self,
         node: &'dom Node,
         layout: Layout,
         transform: Affine,
-        custom_widget_scene: Option<&'a Scene>,
     ) -> ElementCx<'dom, 'a> {
         let style = node
             .stylo_element_data()
@@ -656,10 +924,11 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 Some(blitz_dom::node::ImageData::Svg(svg)) => Some(svg),
                 _ => None,
             },
+            #[cfg(feature = "svg")]
+            svg_simple: element.svg_simple(),
             text_input: element.text_input_data(),
             list_item: element.list_item_data.as_deref(),
-            devtools: self.dom.devtools(),
-            custom_widget_scene,
+            canvas: None,
         }
     }
 }
@@ -709,11 +978,13 @@ struct ElementCx<'dom, 'a> {
     transform: Affine,
     #[cfg(feature = "svg")]
     svg: Option<&'dom blitz_dom::node::SvgImageData>,
+    #[cfg(feature = "svg")]
+    svg_simple: Option<&'dom blitz_dom::node::SimpleSvg>,
     text_input: Option<&'dom TextInputData>,
     list_item: Option<&'dom ListItemLayout>,
-    devtools: &'dom DevtoolSettings,
-    #[cfg_attr(not(feature = "custom-widget"), expect(unused))]
-    custom_widget_scene: Option<&'a Scene>,
+    /// acrender: set when painting the canvas background: the whole canvas, which background layers
+    /// clip to and tile over (they are still positioned against `frame`, the root element's box)
+    canvas: Option<Rect>,
 }
 
 /// Converts parley BoundingBox into peniko Rect
@@ -847,6 +1118,33 @@ impl ElementCx<'_, '_> {
         }
     }
 
+    /// acrender: "…" for `text-overflow: ellipsis` (when the box clips its overflow) and
+    /// `-webkit-line-clamp`, with the marker shaped by layout.
+    fn ellipsis<'l>(&self, text_layout: &'l TextLayout) -> Option<crate::text::Ellipsis<'l>> {
+        use style::values::specified::text::TextOverflowSide;
+        let marker = text_layout.ellipsis.as_ref()?;
+        let clips = !matches!(self.style.get_box().overflow_x, Overflow::Visible);
+        Some(crate::text::Ellipsis {
+            end: (self.frame.content_box.width() * self.scale) as f32,
+            marker,
+            overflow: clips
+                && self.style.get_text().text_overflow.second == TextOverflowSide::Ellipsis,
+            clamp_line: text_layout.clamp.map(|n| n - 1),
+            align: {
+                use style::computed_values::direction::T as Direction;
+                use style::values::specified::TextAlignKeyword as Align;
+                let rtl = self.style.get_inherited_box().direction == Direction::Rtl;
+                match self.style.clone_text_align() {
+                    Align::Center | Align::MozCenter => 0.5,
+                    Align::Right | Align::MozRight => 1.0,
+                    Align::End => (!rtl).into(),
+                    Align::Start => rtl.into(),
+                    Align::Left | Align::MozLeft | Align::Justify => 0.0,
+                }
+            },
+        })
+    }
+
     fn draw_inline_layout(&self, scene: &mut impl PaintScene, pos: Point) {
         if self.node.flags.is_inline_root() {
             let text_layout = self.element
@@ -868,7 +1166,7 @@ impl ElementCx<'_, '_> {
             crate::text::draw_inline_backgrounds(
                 scene,
                 text_layout.layout.lines(),
-                self.context.dom,
+                self.context,
                 transform,
                 self.node.id,
             );
@@ -893,6 +1191,7 @@ impl ElementCx<'_, '_> {
                 transform,
                 self.scale,
                 self.node.id,
+                self.ellipsis(text_layout),
                 &mut draw_text_context,
             );
         }
@@ -952,6 +1251,31 @@ impl ElementCx<'_, '_> {
 
             // Render text
             let mut draw_text_context = self.context.draw_text_context.borrow_mut();
+            // acrender: an empty input shows its placeholder, coloured by `::placeholder` (colour and opacity)
+            let placeholder = input_data
+                .placeholder
+                .as_ref()
+                .filter(|_| input_data.editor.raw_text().is_empty())
+                .and_then(|p| p.try_layout());
+            if let Some(layout) = placeholder {
+                let style = self.context.dom.placeholder_style(self.node.id);
+                let color = style
+                    .as_ref()
+                    .map_or(self.style.clone_color(), |s| s.clone_color());
+                let opacity = style.as_ref().map_or(1.0, |s| s.get_effects().opacity);
+                draw_text_context.color = Some(color.as_srgb_color().multiply_alpha(opacity));
+                crate::text::stroke_text(
+                    scene,
+                    layout.lines(),
+                    self.context.dom,
+                    transform,
+                    self.scale,
+                    self.node.id,
+                    None,
+                    &mut draw_text_context,
+                );
+                return;
+            }
             crate::text::stroke_text(
                 scene,
                 input_data.editor.try_layout().unwrap().lines(),
@@ -959,6 +1283,7 @@ impl ElementCx<'_, '_> {
                 transform,
                 self.scale,
                 self.node.id,
+                None,
                 &mut draw_text_context,
             );
         }
@@ -1014,17 +1339,13 @@ impl ElementCx<'_, '_> {
                 transform,
                 self.scale,
                 self.node.id,
+                None,
                 &mut draw_text_context,
             );
         }
     }
 
-    fn draw_children(
-        &self,
-        scene: &mut impl PaintScene,
-        parent_style_transform: Affine,
-        clip_rect: Rect,
-    ) {
+    fn draw_children(&self, scene: &mut Scene, parent_style_transform: Affine, clip_rect: Rect) {
         // Negative z_index hoisted nodes
 
         if let Some(hoisted) = &self.node.stacking_context {
@@ -1132,7 +1453,9 @@ impl ElementCx<'_, '_> {
         let y = y + y_offset.px() as f64;
 
         let viewport = svg_viewport_affine(svg, paint_size.width, paint_size.height);
-        let transform = (self.transform * viewport).then_translate(Vec2 { x, y });
+        // acrender: content box offset in the element's space (upstream translates in screen space,
+        // ignoring an ancestor's scale / rotation)
+        let inner = Affine::translate(Vec2 { x, y }) * viewport;
 
         self.with_replaced_content_clip(
             scene,
@@ -1141,7 +1464,11 @@ impl ElementCx<'_, '_> {
             x_offset.px(),
             y_offset.px(),
             |scene| {
-                anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
+                // acrender: simple SVGs carry their own drawing commands (no usvg tree)
+                match self.svg_simple {
+                    Some(simple) => draw_simple_svg(scene, simple, self.transform * inner),
+                    None => draw_svg_tree(scene, &svg.tree, self.transform, inner),
+                }
             },
         );
     }
@@ -1161,12 +1488,11 @@ impl ElementCx<'_, '_> {
             || y_offset < 0.0
             || x_offset + paint_size.width > container_size.width
             || y_offset + paint_size.height > container_size.height;
-        self.context.layer_manager.maybe_with_layer(
+        layers::maybe_with_layer(
             scene,
-            overflows,
+            overflows.then(|| self.frame.content_box_path()).as_ref(),
             1.0,
             self.transform,
-            &self.frame.content_box_path(),
             None,
             None,
             paint,
@@ -1226,19 +1552,73 @@ impl ElementCx<'_, '_> {
         }
     }
 
-    #[cfg(feature = "custom-widget")]
-    fn draw_custom_widget(&self, scene: &mut impl PaintScene) {
-        if let Some(widget_scene) = self.custom_widget_scene {
-            let x = self.frame.content_box.origin().x;
-            let y = self.frame.content_box.origin().y;
-            let transform = self.transform.then_translate(Vec2 { x, y });
-
-            // TODO: eliminate clone
-            scene.append_scene(widget_scene.clone(), transform);
+    /// acrender: a 2D canvas: its picture (in bitmap pixels, `width` x `height` attributes) fitted into the
+    /// content box like an image, in a layer of its own (clearRect / destination-* only touch the canvas)
+    fn draw_canvas_picture(&self, scene: &mut impl PaintScene) {
+        if self.node.local_name() != "canvas" {
+            return;
         }
+        let Some(picture) = self.context.dom.canvas_picture(self.node.id) else {
+            return;
+        };
+        let attr = |name, default: f32| {
+            self.node
+                .attr(name)
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .map_or(default, |v| v as f32)
+        };
+        let object_size = taffy::Size {
+            width: attr(local_name!("width"), 300.0),
+            height: attr(local_name!("height"), 150.0),
+        };
+        if object_size.width <= 0.0 || object_size.height <= 0.0 {
+            return;
+        }
+        let container_size = taffy::Size {
+            width: self.frame.content_box.width() as f32,
+            height: self.frame.content_box.height() as f32,
+        };
+        let paint_size = compute_object_fit(
+            container_size,
+            Some(object_size),
+            self.style.clone_object_fit(),
+        );
+        let object_position = self.style.clone_object_position();
+        let x_offset = object_position.horizontal.resolve(
+            CSSPixelLength::new(container_size.width - paint_size.width) / self.scale as f32,
+        ) * self.scale as f32;
+        let y_offset = object_position.vertical.resolve(
+            CSSPixelLength::new(container_size.height - paint_size.height) / self.scale as f32,
+        ) * self.scale as f32;
+        let x = self.frame.content_box.origin().x + x_offset.px() as f64;
+        let y = self.frame.content_box.origin().y + y_offset.px() as f64;
+        let transform = self
+            .transform
+            .pre_translate(Vec2 { x, y })
+            .pre_scale_non_uniform(
+                paint_size.width as f64 / object_size.width as f64,
+                paint_size.height as f64 / object_size.height as f64,
+            );
+        let bitmap = Rect::new(
+            0.0,
+            0.0,
+            object_size.width.into(),
+            object_size.height.into(),
+        );
+        scene.push_layer(
+            Fill::NonZero,
+            peniko::Mix::Normal,
+            1.0,
+            transform,
+            &bitmap,
+            None,
+            None,
+        );
+        scene.append_scene((**picture).clone(), transform);
+        scene.pop_layer();
     }
 
-    fn draw_sub_document(&self, scene: &mut impl PaintScene) {
+    fn draw_sub_document(&self, scene: &mut Scene) {
         if let Some(sub_doc) = self.element.sub_doc_data().map(|doc| doc.inner()) {
             let scale = self.scale;
             let width = self.frame.content_box.width() as u32;
@@ -1250,34 +1630,9 @@ impl ElementCx<'_, '_> {
             let initial_y = translation.y + self.frame.content_box.origin().y;
             // let transform = self.transform.then_translate(Vec2 { x, y });
 
-            let painter = BlitzDomPainter::new(
-                &sub_doc,
-                scale,
-                width,
-                height,
-                initial_x,
-                initial_y,
-                self.custom_widget_scenes,
-            );
+            let painter =
+                BlitzDomPainter::new(&sub_doc, scale, width, height, initial_x, initial_y);
             painter.paint_scene(scene);
-        }
-    }
-
-    fn stroke_devtools(&self, scene: &mut impl PaintScene) {
-        if self.devtools.show_layout {
-            let shape = &self.frame.border_box;
-            let stroke = Stroke::new(self.scale);
-
-            let stroke_color = match self.node.taffy_display() {
-                taffy::Display::Block | taffy::Display::FlowRoot => {
-                    Color::new([1.0, 0.0, 0.0, 1.0])
-                }
-                taffy::Display::Flex => Color::new([0.0, 1.0, 0.0, 1.0]),
-                taffy::Display::Grid => Color::new([0.0, 0.0, 1.0, 1.0]),
-                taffy::Display::None => Color::new([0.0, 0.0, 1.0, 1.0]),
-            };
-
-            scene.stroke(&stroke, self.transform, stroke_color, None, &shape);
         }
     }
 }
@@ -1326,4 +1681,66 @@ fn create_css_rect(style: &ComputedValues, layout: &Layout, scale: f64) -> CssBo
     };
 
     CssBox::new(border_box, border, padding, outline_width, border_radii)
+}
+
+#[cfg(feature = "svg")]
+/// acrender: draws a usvg tree with `inner` (relative to the element) and the element's `transform`
+/// applied on top. svg.rs (like anyrender_svg before it) outsets group-opacity clips by 2px after transforming to the canvas,
+/// so rendering with the full transform made that margin depend on where the element was drawn
+/// (a cached paint fragment is recorded in local space and placed later): render relative to the
+/// element and append, so it is the same either way.
+fn draw_svg_tree(scene: &mut impl PaintScene, tree: &usvg::Tree, transform: Affine, inner: Affine) {
+    let mut local = acgpu::Scene::new();
+    crate::svg::SvgPainter::draw(&mut local, tree, inner);
+    scene.append_scene(local, transform);
+}
+
+/// acrender: paint a simple inline SVG (see blitz-dom's simple_svg.rs)
+#[cfg(feature = "svg")]
+fn draw_simple_svg(
+    scene: &mut impl PaintScene,
+    svg: &blitz_dom::node::SimpleSvg,
+    transform: Affine,
+) {
+    use blitz_dom::node::SimpleOp;
+    let color = |c: &[f32; 4]| peniko::Color::new(*c);
+    for op in &svg.ops {
+        match op {
+            SimpleOp::Fill {
+                path,
+                transform: t,
+                color: c,
+                even_odd,
+            } => {
+                let rule = if *even_odd {
+                    Fill::EvenOdd
+                } else {
+                    Fill::NonZero
+                };
+                scene.fill(rule, transform * *t, color(c), None, path);
+            }
+            SimpleOp::Stroke {
+                path,
+                transform: t,
+                stroke,
+                color: c,
+            } => {
+                scene.stroke(stroke, transform * *t, color(c), None, path);
+            }
+            SimpleOp::Tree { tree, transform: t } => draw_svg_tree(scene, tree, transform, *t),
+            // acrender: clipped to what the group draws (a ±1e6 clip left whole icons unpainted)
+            SimpleOp::PushOpacity { alpha, bounds } => {
+                scene.push_layer(
+                    Fill::NonZero,
+                    peniko::Mix::Normal,
+                    *alpha,
+                    transform,
+                    bounds,
+                    None,
+                    None,
+                );
+            }
+            SimpleOp::Pop => scene.pop_layer(),
+        }
+    }
 }

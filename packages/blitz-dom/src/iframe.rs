@@ -72,6 +72,9 @@ impl BaseDocument {
             incremental: Some(self.incremental_layout),
             abort_signal: Some(abort_signal),
             subdocument_depth: self.subdocument_depth + 1,
+            default_lang: self.nodes.default_lang.clone(), // acrender: iframes inherit it
+            svg_text_only: !self.svg_from_dom,             // acrender
+            skip_iframe_content: self.skip_iframe_content, // acrender
         }
     }
 

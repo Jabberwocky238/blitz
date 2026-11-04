@@ -38,6 +38,8 @@ bitflags! {
         const COLOR_SCHEME = 0b0000_0100;
         /// The media type (e.g. screen/print) changed.
         const MEDIA_TYPE = 0b0000_1000;
+        /// acrender: prefers-reduced-motion changed.
+        const REDUCED_MOTION = 0b0001_0000;
     }
 }
 
@@ -55,6 +57,9 @@ impl DeviceChanges {
         if old.color_scheme != new.color_scheme {
             changes |= Self::COLOR_SCHEME;
         }
+        if old.reduced_motion != new.reduced_motion {
+            changes |= Self::REDUCED_MOTION;
+        }
         changes
     }
 }
@@ -69,7 +74,7 @@ pub(crate) fn make_device(
     let device_size = euclid::Size2D::new(width, height) * viewport.scale();
     let device_pixel_ratio = euclid::Scale::new(viewport.scale());
 
-    Device::new(
+    let mut device = Device::new(
         media_type,
         QuirksMode::NoQuirks,
         viewport_size,
@@ -83,5 +88,8 @@ pub(crate) fn make_device(
         },
         PointerCapabilities::default(),
         PointerCapabilities::default(),
-    )
+    );
+    // acrender: prefers-reduced-motion
+    device.set_reduced_motion(viewport.reduced_motion);
+    device
 }

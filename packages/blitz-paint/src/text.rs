@@ -1,4 +1,4 @@
-use anyrender::PaintScene;
+use acgpu::PaintScene;
 use blitz_dom::{BaseDocument, NodeId, node::TextBrush, util::ToColorColor};
 use kurbo::{Affine, BezPath, Cap, Circle, Rect, Stroke};
 use parley::{Affinity, Cursor, Layout, Line, PositionedLayoutItem, Selection};
@@ -20,50 +20,237 @@ use crate::{FONT_EMBOLDEN_ENABLED, SELECTION_COLOR};
 /// fill a rectangle covering the run's advance and its font's ascent/descent so that the
 /// background sits behind the text.
 ///
+/// acrender: an element with inline edges (padding / border / margin, or a rounded background; see
+/// blitz-dom `InlineEdge`) is drawn per line between its edge boxes instead: the padding box (the
+/// runs' content area grown by the vertical padding and border) with its background, rounded
+/// corners and border only at the ends that are on this line (`box-decoration-break: slice`).
+///
 /// The inline root's own background is painted separately (as a normal block box), so
 /// runs belonging to the root are skipped to avoid drawing it twice.
-pub(crate) fn draw_inline_backgrounds<'a>(
+pub(crate) fn draw_inline_backgrounds<'a, 'dom>(
     scene: &mut impl PaintScene,
     lines: impl Iterator<Item = Line<'a, TextBrush>>,
-    doc: &BaseDocument,
+    painter: &'dom crate::render::BlitzDomPainter<'dom, '_>,
     transform: Affine,
     inline_root_id: NodeId,
 ) {
+    let doc = painter.dom;
+    use blitz_dom::node::InlineEdge;
+    // elements open at the end of the previous line (they continue on this one), in opening order
+    let mut carried: Vec<(NodeId, u64)> = Vec::new();
+    let mut fragments: Vec<InlineFragment> = Vec::new();
+    let mut opened = 0u64;
     for line in lines {
+        let metrics = line.metrics();
+        let mut open: Vec<InlineFragment> = carried
+            .drain(..)
+            .map(|(node, order)| {
+                InlineFragment::new(node, None, metrics.inline_min_coord as f64, order)
+            })
+            .collect();
         for item in line.items() {
-            let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
-                continue;
-            };
-
-            let node_id = glyph_run.style().brush.id;
-            if node_id == inline_root_id {
-                continue;
+            match item {
+                PositionedLayoutItem::InlineBox(ibox) => {
+                    let Some(edge) = InlineEdge::of(ibox.id) else {
+                        continue;
+                    };
+                    let (x0, x1) = (ibox.x as f64, (ibox.x + ibox.width) as f64);
+                    match edge.end {
+                        false => {
+                            opened += 1;
+                            open.push(InlineFragment::new(edge.node, Some(x0), x1, opened));
+                        }
+                        true => {
+                            if let Some(at) = open.iter().rposition(|f| f.node == edge.node) {
+                                let mut fragment = open.remove(at);
+                                fragment.end = Some(x1);
+                                fragment.right = fragment.right.max(x0);
+                                fragments.push(fragment);
+                            }
+                        }
+                    }
+                }
+                PositionedLayoutItem::GlyphRun(glyph_run) => {
+                    let run_metrics = glyph_run.run().font_metrics();
+                    let baseline = glyph_run.baseline() as f64;
+                    let (x0, x1) = (
+                        glyph_run.offset() as f64,
+                        (glyph_run.offset() + glyph_run.advance()) as f64,
+                    );
+                    for fragment in &mut open {
+                        fragment.cover(
+                            x0,
+                            x1,
+                            baseline - run_metrics.ascent as f64,
+                            baseline + run_metrics.descent as f64,
+                        );
+                    }
+                    let node_id = glyph_run.style().brush.id;
+                    if node_id == inline_root_id || open.iter().any(|f| f.node == node_id) {
+                        continue;
+                    }
+                    let Some(styles) = doc.get_node(node_id).and_then(|node| node.primary_styles())
+                    else {
+                        continue;
+                    };
+                    let current_color = styles.clone_color();
+                    let bg_color = styles
+                        .get_background()
+                        .background_color
+                        .resolve_to_absolute(&current_color)
+                        .as_srgb_color();
+                    if bg_color == Color::TRANSPARENT {
+                        continue;
+                    }
+                    let y0 = baseline - run_metrics.ascent as f64;
+                    let y1 = baseline + run_metrics.descent as f64;
+                    scene.fill(
+                        Fill::NonZero,
+                        transform,
+                        bg_color,
+                        None,
+                        &Rect::new(x0, y0, x1, y1),
+                    );
+                }
             }
-
-            let Some(styles) = doc.get_node(node_id).and_then(|node| node.primary_styles()) else {
-                continue;
-            };
-
-            let current_color = styles.clone_color();
-            let bg_color = styles
-                .get_background()
-                .background_color
-                .resolve_to_absolute(&current_color)
-                .as_srgb_color();
-            if bg_color == Color::TRANSPARENT {
-                continue;
-            }
-
-            let metrics = glyph_run.run().font_metrics();
-            let x = glyph_run.offset() as f64;
-            let w = glyph_run.advance() as f64;
-            let baseline = glyph_run.baseline() as f64;
-            let y0 = baseline - metrics.ascent as f64;
-            let y1 = baseline + metrics.descent as f64;
-            let rect = Rect::new(x, y0, x + w, y1);
-
-            scene.fill(Fill::NonZero, transform, bg_color, None, &rect);
         }
+        // still open at the end of the line: sliced here, continues on the next one
+        for fragment in open {
+            carried.push((fragment.node, fragment.order));
+            fragments.push(fragment);
+        }
+    }
+    // outer elements first (they opened first), so nested backgrounds sit on top
+    fragments.sort_by_key(|f| f.order);
+    // percentages of an inline element's padding / margin are of its containing block's width (the
+    // inline root's content box)
+    let basis = doc.get_node(inline_root_id).map_or(0.0, |root| {
+        let l = root.final_layout();
+        l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right
+    });
+    for fragment in &fragments {
+        fragment.draw(scene, painter, transform, basis);
+    }
+}
+
+/// acrender: one line's piece of an inline element with edges (see draw_inline_backgrounds)
+struct InlineFragment {
+    node: NodeId,
+    /// The start / end edge box's outer x when that edge is on this line
+    start: Option<f64>,
+    end: Option<f64>,
+    /// Content extent seen on this line (x of the first / last content, line-relative)
+    left: f64,
+    right: f64,
+    top: f64,
+    bottom: f64,
+    /// When the element opened (outer ones first)
+    order: u64,
+}
+
+impl InlineFragment {
+    fn new(node: NodeId, start: Option<f64>, x: f64, order: u64) -> Self {
+        Self {
+            node,
+            start,
+            end: None,
+            left: x,
+            right: x,
+            top: f64::INFINITY,
+            bottom: f64::NEG_INFINITY,
+            order,
+        }
+    }
+
+    fn cover(&mut self, x0: f64, x1: f64, y0: f64, y1: f64) {
+        if self.top > self.bottom {
+            self.left = x0;
+        }
+        self.right = self.right.max(x1);
+        self.top = self.top.min(y0);
+        self.bottom = self.bottom.max(y1);
+    }
+
+    /// basis: the containing block's width (CSS px), for percentage padding / margin
+    fn draw<'dom>(
+        &self,
+        scene: &mut impl PaintScene,
+        painter: &'dom crate::render::BlitzDomPainter<'dom, '_>,
+        transform: Affine,
+        basis: f32,
+    ) {
+        use crate::kurbo_css::{CssBox, NonUniformRoundedRectRadii};
+        use kurbo::{Insets, Vec2};
+        let Some(node) = painter.dom.get_node(self.node) else {
+            return;
+        };
+        let Some(style) = node.primary_styles() else {
+            return;
+        };
+        if self.top > self.bottom {
+            return;
+        }
+        let scale = painter.dom.viewport().scale_f64();
+        let px = |l: &style::values::computed::LengthPercentage| {
+            l.resolve(Length::new(basis)).px() as f64 * scale
+        };
+        let (p, m, b) = (style.get_padding(), style.get_margin(), style.get_border());
+        let margin = |v: &style::values::computed::Margin| match v {
+            style::values::generics::length::GenericMargin::LengthPercentage(l) => px(l),
+            _ => 0.0,
+        };
+        let width =
+            |w: &style::values::computed::BorderSideWidth,
+             s: style::values::computed::BorderStyle| match s.none_or_hidden() {
+                true => 0.0,
+                false => w.0.to_f64_px() * scale,
+            };
+        let (at_start, at_end) = (self.start.is_some(), self.end.is_some());
+        // the left / right sides only at the ends that are on this line (`box-decoration-break: slice`)
+        let border = Insets {
+            x0: if at_start {
+                width(&b.border_left_width, b.border_left_style)
+            } else {
+                0.0
+            },
+            y0: width(&b.border_top_width, b.border_top_style),
+            x1: if at_end {
+                width(&b.border_right_width, b.border_right_style)
+            } else {
+                0.0
+            },
+            y1: width(&b.border_bottom_width, b.border_bottom_style),
+        };
+        let padding = Insets {
+            x0: if at_start { px(&p.padding_left.0) } else { 0.0 },
+            y0: px(&p.padding_top.0),
+            x1: if at_end { px(&p.padding_right.0) } else { 0.0 },
+            y1: px(&p.padding_bottom.0),
+        };
+        // border box: the edge boxes hold margin + border + padding; vertically the content area grown
+        let x0 = self.start.map_or(self.left, |x| x + margin(&m.margin_left));
+        let x1 = self.end.map_or(self.right, |x| x - margin(&m.margin_right));
+        let y0 = self.top - padding.y0 - border.y0;
+        let y1 = self.bottom + padding.y1 + border.y1;
+        if x1 <= x0 {
+            return;
+        }
+        let (w, h) = (x1 - x0, y1 - y0);
+        let radius = |r: &style::values::computed::BorderCornerRadius, on: bool| match on {
+            true => Vec2::new(
+                r.0.width.0.resolve(Length::new((w / scale) as f32)).px() as f64 * scale,
+                r.0.height.0.resolve(Length::new((h / scale) as f32)).px() as f64 * scale,
+            ),
+            false => Vec2::ZERO,
+        };
+        let radii = NonUniformRoundedRectRadii {
+            top_left: radius(&b.border_top_left_radius, at_start),
+            top_right: radius(&b.border_top_right_radius, at_end),
+            bottom_right: radius(&b.border_bottom_right_radius, at_end),
+            bottom_left: radius(&b.border_bottom_left_radius, at_start),
+        };
+        let frame = CssBox::new(Rect::new(0.0, 0.0, w, h), border, padding, 0.0, radii);
+        painter.draw_inline_fragment(scene, node, frame, transform * Affine::translate((x0, y0)));
     }
 }
 
@@ -249,6 +436,8 @@ pub(crate) struct DrawTextContext {
     path_scratch: Vec<NodeId>,
     deco_boxes: Vec<LineDecoration>,
     win_ascent_ratios: WinAscentCache,
+    /// acrender: glyph colour for the next stroke_text instead of the runs' own (an input's placeholder)
+    pub(crate) color: Option<Color>,
 }
 
 /// Resolve the CSS `text-decoration-thickness` to a device-pixel size.
@@ -294,7 +483,7 @@ fn draw_decoration_line(
     baseline: f32,
     offset: f32,
     size: f32,
-    brush: &anyrender::Paint,
+    brush: &acgpu::Paint,
     double_dir: f64,
     deco_style: TextDecorationStyle,
     inset_start: f64,
@@ -424,7 +613,7 @@ fn flush_line_decorations(
         if width <= 0.0 {
             continue;
         }
-        let brush = anyrender::Paint::from(deco.color);
+        let brush = acgpu::Paint::from(deco.color);
 
         // `text-decoration-inset` shortens (or, when negative, extends) the line from the
         // inline-start/end edges. Percentages resolve against the decoration line length
@@ -562,6 +751,75 @@ fn flush_line_decorations(
     }
 }
 
+/// acrender: where lines end in "…" (`text-overflow: ellipsis`, `-webkit-line-clamp`).
+pub(crate) struct Ellipsis<'a> {
+    /// The box's content box end edge, in layout units.
+    pub end: f32,
+    /// "…" shaped in the box's own style.
+    pub marker: &'a parley::Layout<TextBrush>,
+    /// `text-overflow: ellipsis` applies: lines overflowing `end` are cut.
+    pub overflow: bool,
+    /// The last line `-webkit-line-clamp` keeps: it always ends in "…".
+    pub clamp_line: Option<usize>,
+    /// Where `text-align` puts that line once "…" is part of it: 0 at the left, 0.5 centred,
+    /// 1 at the right.
+    pub align: f32,
+}
+
+/// Synthetic emboldening for a run of `font_size` (physical px), when enabled.
+fn embolden(font_size: f32, scale: f64) -> kurbo::Vec2 {
+    if FONT_EMBOLDEN_ENABLED {
+        let fs = font_size as f64 / scale;
+        kurbo::Vec2::new((0.015125 * fs).min(0.3), (0.0121 * fs).min(0.3))
+    } else {
+        kurbo::Vec2::default()
+    }
+}
+
+/// acrender: where `run`'s glyphs that fit before `limit` end (the run's start if none does).
+fn kept_end(run: &parley::GlyphRun<'_, TextBrush>, limit: f32) -> f32 {
+    run.positioned_glyphs()
+        .take_while(|g| g.x + g.advance <= limit)
+        .last()
+        .map_or(run.offset(), |g| g.x + g.advance)
+}
+
+/// acrender: draws the "…" marker run starting at `x` on the line with baseline `baseline`.
+fn draw_ellipsis_marker(
+    scene: &mut impl PaintScene,
+    marker: &parley::GlyphRun<'_, TextBrush>,
+    (x, baseline): (f32, f32),
+    color: Color,
+    transform: Affine,
+    scale: f64,
+) {
+    let run = marker.run();
+    let embolden = embolden(run.font_size(), scale);
+    let glyph_xform = run
+        .synthesis()
+        .skew()
+        .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
+    let (dx, dy) = (x - marker.offset(), baseline - marker.baseline());
+    scene.draw_glyphs(
+        run.font(),
+        run.font_size(),
+        !FONT_EMBOLDEN_ENABLED,
+        bytemuck::cast_slice(run.normalized_coords()),
+        embolden,
+        Fill::NonZero,
+        &acgpu::Paint::from(color),
+        1.0,
+        transform,
+        glyph_xform,
+        marker.positioned_glyphs().map(|glyph| acgpu::Glyph {
+            id: glyph.id as _,
+            x: glyph.x + dx,
+            y: glyph.y + dy,
+        }),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stroke_text<'a>(
     scene: &mut impl PaintScene,
     lines: impl Iterator<Item = Line<'a, TextBrush>>,
@@ -569,6 +827,7 @@ pub(crate) fn stroke_text<'a>(
     transform: Affine,
     scale: f64,
     inline_root_id: NodeId,
+    ellipsis: Option<Ellipsis<'a>>,
     context: &mut DrawTextContext,
 ) {
     let DrawTextContext {
@@ -576,10 +835,26 @@ pub(crate) fn stroke_text<'a>(
         path_scratch,
         deco_boxes,
         win_ascent_ratios,
+        color,
     } = context;
+    let color = color.take();
     stack.clear();
     path_scratch.clear();
     deco_boxes.clear();
+
+    // acrender: `text-overflow: ellipsis`: the box's end edge and the "…" marker's glyph run
+    let ellipsis = ellipsis.and_then(|e| {
+        let run = e
+            .marker
+            .lines()
+            .next()?
+            .items()
+            .find_map(|item| match item {
+                PositionedLayoutItem::GlyphRun(run) => Some(run),
+                _ => None,
+            })?;
+        Some((e, run))
+    });
 
     // Persistent stack mirroring the ancestor path (inline root -> current run's
     // node) as we walk the runs. The `text-decoration-*` properties are *not*
@@ -588,15 +863,58 @@ pub(crate) fn stroke_text<'a>(
     // ancestor chain on every run, we cache each node's resolved values here and,
     // for each run, only resolve styles for the nodes newly descended into (popping
     // as we ascend). `path_scratch` is a reusable buffer for the run's node path.
-    for line in lines {
+    let last_line = ellipsis.as_ref().and_then(|(e, _)| e.clamp_line);
+    for (index, line) in lines.enumerate() {
+        // acrender: lines after the one `-webkit-line-clamp` ends on are not painted (as in Firefox;
+        // clipping alone leaves the tops of tall glyphs, e.g. CJK fallback fonts, showing)
+        if last_line.is_some_and(|last| index > last) {
+            break;
+        }
         // Decorations accumulated for this line, keyed by decorating box, so each box is
         // painted once (spanning all its runs) using its own font — matching Firefox, which
         // draws one decoration per box rather than one stepped segment per differently-sized
         // run. Clearing preserves the allocation for the next line and inline context.
         deco_boxes.clear();
 
+        // acrender: on a line that overflows the box, glyphs from the first one that no longer leaves room
+        // for "…" onwards are dropped, and "…" drawn after the last glyph kept.
+        let line_end =
+            line.metrics().offset + line.metrics().advance - line.metrics().hanging_advance;
+        let clamped = ellipsis
+            .as_ref()
+            .is_some_and(|(e, _)| e.clamp_line == Some(index));
+        let mut cut = ellipsis
+            .as_ref()
+            .filter(|(e, _)| clamped || (e.overflow && line_end > e.end + 0.5))
+            .map(|(e, marker)| e.end - marker.advance());
+
+        // acrender: the clamped line is re-aligned with "…" as part of it (as Firefox lays it out)
+        let transform = match (clamped, cut, &ellipsis) {
+            (true, Some(limit), Some((e, marker))) => {
+                let kept_end = line
+                    .items()
+                    .find_map(|item| match item {
+                        PositionedLayoutItem::GlyphRun(run)
+                            if run.offset() + run.advance() > limit =>
+                        {
+                            Some(kept_end(&run, limit))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(line_end);
+                let start = line.metrics().offset;
+                let width = kept_end + marker.advance() - start;
+                let shift = (e.end - width).max(0.0) * e.align - start;
+                transform * Affine::translate((shift as f64, 0.0))
+            }
+            _ => transform,
+        };
+
         for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
+                if cut.is_some_and(f32::is_nan) {
+                    continue;
+                }
                 let run = glyph_run.run();
                 let font = run.font();
                 let font_size = run.font_size();
@@ -635,14 +953,19 @@ pub(crate) fn stroke_text<'a>(
 
                 // The glyph colour comes from the run's own node (the stack top): `color`
                 // inherits, so the innermost inline element already carries the right value.
-                let text_color = stack.last().map(|e| e.text_color).unwrap_or(Color::BLACK);
+                let text_color = color
+                    .or(stack.last().map(|e| e.text_color))
+                    .unwrap_or(Color::BLACK);
 
-                let embolden = if FONT_EMBOLDEN_ENABLED {
-                    let fs = font_size as f64 / scale;
-                    kurbo::Vec2::new((0.015125 * fs).min(0.3), (0.0121 * fs).min(0.3))
-                } else {
-                    kurbo::Vec2::default()
-                };
+                let embolden = embolden(font_size, scale);
+
+                // (limit, where "…" starts) when this run is where the line gets cut
+                let cut_here = cut
+                    .filter(|limit| glyph_run.offset() + glyph_run.advance() > *limit)
+                    .map(|limit| (limit, kept_end(&glyph_run, limit)));
+                if cut_here.is_some() {
+                    cut = Some(f32::NAN);
+                }
 
                 let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
                 scene.draw_glyphs(
@@ -652,21 +975,40 @@ pub(crate) fn stroke_text<'a>(
                     normalized_coords,
                     embolden,
                     Fill::NonZero,
-                    &anyrender::Paint::from(text_color),
+                    &acgpu::Paint::from(text_color),
                     1.0, // alpha
                     transform,
                     glyph_xform,
-                    glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
-                        id: glyph.id as _,
-                        x: glyph.x,
-                        y: glyph.y,
-                    }),
+                    glyph_run
+                        .positioned_glyphs()
+                        .take_while(|g| cut_here.is_none_or(|(limit, _)| g.x + g.advance <= limit))
+                        .map(|glyph| acgpu::Glyph {
+                            id: glyph.id as _,
+                            x: glyph.x,
+                            y: glyph.y,
+                        }),
                 );
+                // "…" in the box's own font and colour
+                if let (Some((_, x)), Some((_, marker))) = (cut_here, &ellipsis) {
+                    let root_color = stack.first().map_or(text_color, |e| e.text_color);
+                    draw_ellipsis_marker(
+                        scene,
+                        marker,
+                        (x, glyph_run.baseline()),
+                        root_color,
+                        transform,
+                        scale,
+                    );
+                }
 
                 // Accumulate this run's contribution to each decorating box on its ancestor
                 // path. The decoration is drawn once per box after the whole line has been
                 // walked (see `flush_line_decorations`), so mixed font sizes within a box
                 // produce a single straight line rather than one stepped segment per run.
+                // acrender: only when some box on the path has a decoration
+                if stack.iter().all(|entry| entry.decoration.is_none()) {
+                    continue;
+                }
                 let geometry = DecorationRunGeometry {
                     baseline: glyph_run.baseline(),
                     ascent: metrics.ascent,
@@ -680,7 +1022,10 @@ pub(crate) fn stroke_text<'a>(
                 };
                 let run_node_id = style.brush.id;
                 let run_x0 = glyph_run.offset() as f64;
-                let run_x1 = run_x0 + glyph_run.advance() as f64;
+                let run_x1 = match (cut_here, &ellipsis) {
+                    (Some((_, x)), Some((_, marker))) => (x + marker.advance()) as f64,
+                    _ => run_x0 + glyph_run.advance() as f64,
+                };
 
                 for entry in stack.iter() {
                     if entry.decoration.is_none() {
@@ -713,6 +1058,15 @@ pub(crate) fn stroke_text<'a>(
                     }
                 }
             }
+        }
+
+        // acrender: a line `-webkit-line-clamp` ends on that fits whole: "…" goes after it
+        if let (true, Some(limit), Some((_, marker))) = (clamped, cut, &ellipsis)
+            && !limit.is_nan()
+        {
+            let color = stack.first().map_or(Color::BLACK, |e| e.text_color);
+            let at = (line_end, line.metrics().baseline);
+            draw_ellipsis_marker(scene, marker, at, color, transform, scale);
         }
 
         flush_line_decorations(

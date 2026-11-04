@@ -5,27 +5,21 @@ use super::non_uniform_radii::NonUniformRoundedRectRadii;
 use super::{Corner, CssBoxKind, Direction, Edge, add_insets, get_corner_insets};
 
 /// There are several nested boxes at play here:
-/// We have 4 boxes, 4 corners, and clockwise/anticlockwise for a total of 16 different options
+/// We have 3 boxes, 4 corners, and clockwise/anticlockwise
 ///
 /// ```a
-///    *--------------------------------------------------------*  <--- CssBox::OutlineBox
-///    |                         Outline                        |
-///    |    *----------------------------------------------*    |  <--- CssBox::BorderBox
-///    |    |                    Border                    |    |
-///    |    |    *------------------------------------*    |    |  <--- CssBox::PaddingBox
-///    |    |    |               Padding              |    |    |
-///    |    |    |    *--------------------------*    |    |    |  <--- CssBox::ContentBox
-///    |    |    |    |          Content         |    |    |    |
-///    |    |    |    |                          |    |    |    |
-///    |    |    |    |                          |    |    |    |
-///    |    |    |    |                          |    |    |    |
-///    |    |    |    *--------------------------*    |    |    |
-///    |    |    |                                    |    |    |
-///    |    |    *------------------------------------*    |    |
-///    |    |                                              |    |
-///    |    *----------------------------------------------*    |
-///    |                                                        |
-///    *--------------------------------------------------------*
+///    *----------------------------------------------*  <--- CssBox::BorderBox
+///    |                    Border                    |
+///    |    *------------------------------------*    |  <--- CssBox::PaddingBox
+///    |    |               Padding              |    |
+///    |    |    *--------------------------*    |    |  <--- CssBox::ContentBox
+///    |    |    |          Content         |    |    |
+///    |    |    |                          |    |    |
+///    |    |    *--------------------------*    |    |
+///    |    |                                    |    |
+///    |    *------------------------------------*    |
+///    |                                              |
+///    *----------------------------------------------*
 /// ```
 ///
 #[derive(Debug, Clone)]
@@ -33,7 +27,6 @@ pub struct CssBox {
     pub border_box: Rect,
     pub padding_box: Rect,
     pub content_box: Rect,
-    pub outline_box: Rect,
 
     pub padding_width: Insets,
     pub border_width: Insets,
@@ -52,7 +45,6 @@ impl CssBox {
     ) -> Self {
         let padding_box = border_box - border;
         let content_box = padding_box - padding;
-        let outline_box = border_box.inset(outline_width);
 
         // Correct the border radii if they are too big if two border radii would intersect, then we need to shrink
         // ALL border radii by the same factor such that they do not
@@ -78,7 +70,6 @@ impl CssBox {
             padding_box,
             border_box,
             content_box,
-            outline_box,
             outline_width,
             padding_width: padding,
             border_width: border,
@@ -193,20 +184,6 @@ impl CssBox {
             0.0,
             slice_radii,
         )
-    }
-
-    /// Construct a bezpath drawing the outline
-    pub fn outline(&self) -> BezPath {
-        let mut path = BezPath::new();
-
-        // TODO: this has been known to produce quirky outputs with hugely rounded edges
-        self.shape(&mut path, CssBoxKind::OutlineBox, Direction::Clockwise);
-        path.move_to(self.corner(Corner::TopLeft, CssBoxKind::BorderBox));
-
-        self.shape(&mut path, CssBoxKind::BorderBox, Direction::Anticlockwise);
-        path.move_to(self.corner(Corner::TopLeft, CssBoxKind::BorderBox));
-
-        path
     }
 
     /// Construct a bezpath drawing the frame border
@@ -324,7 +301,6 @@ impl CssBox {
 
     fn corner(&self, corner: Corner, css_box: CssBoxKind) -> Point {
         let Rect { x0, y0, x1, y1 } = match css_box {
-            CssBoxKind::OutlineBox => self.outline_box,
             CssBoxKind::BorderBox => self.border_box,
             CssBoxKind::PaddingBox => self.padding_box,
             CssBoxKind::ContentBox => self.content_box,
@@ -506,7 +482,6 @@ impl CssBox {
         }
 
         let css_box: Insets = match side {
-            OutlineBox => return false,
             BorderBox => return false,
             PaddingBox => self.border_width,
             ContentBox => add_insets(self.border_width, self.padding_width),
@@ -565,7 +540,6 @@ impl CssBox {
 
         let radii: Vec2 = match side {
             BorderBox => corner_radii,
-            OutlineBox => corner_radii + Vec2::new(self.outline_width, self.outline_width),
             PaddingBox => corner_radii - get_corner_insets(*border_width, corner),
             ContentBox => {
                 corner_radii - get_corner_insets(add_insets(*border_width, *padding_width), corner)

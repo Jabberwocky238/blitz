@@ -54,6 +54,12 @@ input {
     display: inline-block;
 }
 
+/* acrender: like Firefox: the input's colour at 54% unless the page gives one (the text is drawn by the
+   input, see blitz-paint draw_text_input_text) */
+::placeholder {
+    color: color-mix(in srgb, currentcolor 54%, transparent);
+}
+
 /* https://html.spec.whatwg.org/#hidden-elements */
 input[type="hidden" i] {
     display: none !important;

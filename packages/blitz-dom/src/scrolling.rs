@@ -78,14 +78,6 @@ pub(crate) struct ScrollRequest {
     pub(crate) interrupt_animation: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct FlingState {
-    pub(crate) target: NodeId,
-    pub(crate) last_seen_time: f64,
-    pub(crate) x_velocity: f64,
-    pub(crate) y_velocity: f64,
-}
-
 /// State driving a smooth (animated) scroll towards a target offset. Used for
 /// fragment navigation (`#anchor` links) and programmatic smooth scrolling.
 #[derive(Debug, Clone, PartialEq)]
@@ -105,7 +97,6 @@ pub(crate) struct ScrollToState {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ScrollAnimationState {
     None,
-    Fling(FlingState),
     /// A smooth scroll of the viewport towards a target offset.
     ScrollTo(ScrollToState),
 }
@@ -405,31 +396,6 @@ impl BaseDocument {
         )
     }
 
-    pub(crate) fn scroll_chain_by(
-        &mut self,
-        anchor_node_id: Option<NodeId>,
-        scroll_x: f64,
-        scroll_y: f64,
-        dispatch_event: &mut dyn FnMut(DomEvent),
-    ) -> bool {
-        self.scroll(
-            ScrollRequest {
-                target: anchor_node_id.map_or(ScrollTarget::Viewport, ScrollTarget::Node),
-                amount: ScrollAmount::By(Point {
-                    x: -scroll_x,
-                    y: -scroll_y,
-                }),
-                overflow: ScrollOverflow::Chain,
-                source: ScrollSource::User,
-                behavior: ScrollBehavior::Instant,
-                // A user-initiated scroll aborts any smooth scroll in progress, so that the
-                // two do not fight over the scroll offset for the rest of the animation.
-                interrupt_animation: true,
-            },
-            dispatch_event,
-        )
-    }
-
     /// Duration (in milliseconds) of an animated scroll.
     const SMOOTH_SCROLL_DURATION_MS: f64 = 300.0;
 
@@ -721,30 +687,6 @@ impl BaseDocument {
 
     pub fn resolve_scroll_animation(&mut self) {
         match &mut self.scroll_animation {
-            ScrollAnimationState::Fling(fling_state) => {
-                let time_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64 as f64;
-
-                let time_diff_ms = time_ms - fling_state.last_seen_time;
-
-                // 0.95 @ 60fps normalized to actual frame times
-                let deceleration = 1.0 - ((0.05 / 16.66666) * time_diff_ms);
-
-                fling_state.x_velocity *= deceleration;
-                fling_state.y_velocity *= deceleration;
-                fling_state.last_seen_time = time_ms;
-                let fling_state = fling_state.clone();
-
-                let dx = fling_state.x_velocity * time_diff_ms;
-                let dy = fling_state.y_velocity * time_diff_ms;
-
-                self.scroll_chain_by(Some(fling_state.target), dx, dy, &mut |_| {});
-                if fling_state.x_velocity.abs() < 0.1 && fling_state.y_velocity.abs() < 0.1 {
-                    self.scroll_animation = ScrollAnimationState::None;
-                }
-            }
             ScrollAnimationState::ScrollTo(scroll_to) => {
                 let scroll_to = scroll_to.clone();
                 let time_ms = SystemTime::now()

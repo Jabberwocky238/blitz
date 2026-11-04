@@ -1,7 +1,5 @@
 //! Abstraction over windowing / operating system ("shell") functionality
 
-use cursor_icon::CursorIcon;
-
 /// Type representing an error performing a clipboard operation
 // TODO: fill out with meaningful errors
 pub struct ClipboardError;
@@ -10,9 +8,6 @@ pub struct ClipboardError;
 /// to access that functionality without depending on a specific shell environment.
 pub trait ShellProvider: Send + Sync + 'static {
     fn request_redraw(&self) {}
-    fn set_cursor(&self, icon: Option<CursorIcon>) {
-        let _ = icon;
-    }
     fn set_window_title(&self, title: String) {
         let _ = title;
     }
@@ -76,6 +71,8 @@ pub enum ColorScheme {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Viewport {
     pub color_scheme: ColorScheme,
+    /// acrender: `prefers-reduced-motion: reduce`
+    pub reduced_motion: bool,
     pub window_size: (u32, u32),
     pub hidpi_scale: f32,
     pub zoom: f32,
@@ -88,6 +85,7 @@ impl Default for Viewport {
             hidpi_scale: 1.0,
             zoom: 1.0,
             color_scheme: ColorScheme::Light,
+            reduced_motion: false,
         }
     }
 }
@@ -104,6 +102,7 @@ impl Viewport {
             hidpi_scale: scale_factor,
             zoom: 1.0,
             color_scheme,
+            reduced_motion: false,
         }
     }
 

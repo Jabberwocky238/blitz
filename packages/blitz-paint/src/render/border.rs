@@ -1,4 +1,4 @@
-use anyrender::PaintScene;
+use acgpu::PaintScene;
 use blitz_dom::node::SpecialElementData;
 use kurbo::{BezPath, Cap, Circle, Insets, Join, PathEl, Point, Rect, Shape as _, Stroke, Vec2};
 use peniko::{Color, Fill};
@@ -612,20 +612,51 @@ impl ElementCx<'_, '_> {
             OutlineStyle::BorderStyle(style) => style,
         };
 
-        let path = match style {
-            BorderStyle::None | BorderStyle::Hidden => return,
-            BorderStyle::Solid => self.frame.outline(),
-
-            // TODO: Implement other border styles
-            BorderStyle::Inset
-            | BorderStyle::Groove
-            | BorderStyle::Outset
-            | BorderStyle::Ridge
-            | BorderStyle::Dotted
-            | BorderStyle::Dashed
-            | BorderStyle::Double => self.frame.outline(),
+        // acrender: drawn after the content and outside the opacity layer (which clips to the border
+        // box), so the element's own opacity is applied to the colour here.
+        let color = color.multiply_alpha(self.style.get_effects().opacity);
+        // acrender: stroke the outline's centre line, honouring `outline-offset` (upstream always drew
+        // it just outside the border box, so a negative offset inside a clipping ancestor vanished)
+        // and drawing `dashed`/`dotted` as such (upstream: solid). Corners follow border-radius
+        // grown by the offset, like Firefox.
+        if matches!(style, BorderStyle::None | BorderStyle::Hidden)
+            || self.frame.outline_width <= 0.0
+        {
+            return;
+        }
+        let width = self.frame.outline_width;
+        let grow = outline.outline_offset.to_f64_px() * self.scale + width / 2.0;
+        let radii = &self.frame.border_radii;
+        let corner = |r: Vec2| {
+            if r.x.max(r.y) > 0.0 {
+                ((r.x + r.y) / 2.0 + grow).max(0.0)
+            } else {
+                0.0
+            }
         };
-
-        scene.fill(Fill::NonZero, self.transform, color, None, &path);
+        let centerline = self.frame.border_box.inflate(grow, grow).to_rounded_rect((
+            corner(radii.top_left),
+            corner(radii.top_right),
+            corner(radii.bottom_right),
+            corner(radii.bottom_left),
+        ));
+        let (dash, gap) = match style {
+            BorderStyle::Dashed => dashed_ratios(width, self.scale),
+            BorderStyle::Dotted => (1.0, 1.0),
+            _ => {
+                let stroke = Stroke::new(width).with_join(Join::Miter);
+                scene.stroke(&stroke, self.transform, color, None, &centerline);
+                return;
+            }
+        };
+        // a whole number of dash periods around the perimeter, so the pattern closes cleanly
+        let perimeter = centerline.perimeter(0.1);
+        let period0 = (dash + gap) * width;
+        let period = perimeter / (perimeter / period0).round().max(1.0);
+        let stroke = Stroke::new(width).with_caps(Cap::Butt).with_dashes(
+            0.0,
+            [period * dash / (dash + gap), period * gap / (dash + gap)],
+        );
+        scene.stroke(&stroke, self.transform, color, None, &centerline);
     }
 }

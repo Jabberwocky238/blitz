@@ -1,6 +1,6 @@
 use super::ElementCx;
 use crate::color::{Color, ToColorColor as _};
-use anyrender::PaintScene;
+use acgpu::PaintScene;
 use kurbo::{Rect, Vec2};
 use peniko::{Compose, Fill, Mix};
 
@@ -23,24 +23,27 @@ impl ElementCx<'_, '_> {
         let bg_is_opaque = bg_color.components[3] >= 1.0;
         let needs_clip = opacity < 1.0 || !bg_is_opaque;
 
-        let max_shadow_rect = box_shadow.iter().fold(Rect::ZERO, |prev, shadow| {
-            let x = shadow.base.horizontal.px() as f64 * self.scale;
-            let y = shadow.base.vertical.px() as f64 * self.scale;
-            let blur = shadow.base.blur.px() as f64 * self.scale;
-            let spread = shadow.spread.px() as f64 * self.scale;
-            let offset = spread + blur * 2.5;
+        // acrender: the clip (around the border box, out to the farthest shadow) only when needed
+        let shadow_clip = needs_clip.then(|| {
+            let max_shadow_rect = box_shadow.iter().fold(Rect::ZERO, |prev, shadow| {
+                let x = shadow.base.horizontal.px() as f64 * self.scale;
+                let y = shadow.base.vertical.px() as f64 * self.scale;
+                let blur = shadow.base.blur.px() as f64 * self.scale;
+                let spread = shadow.spread.px() as f64 * self.scale;
+                let offset = spread + blur * 2.5;
 
-            let rect = self.frame.border_box.inflate(offset, offset) + Vec2::new(x, y);
+                let rect = self.frame.border_box.inflate(offset, offset) + Vec2::new(x, y);
 
-            prev.union(rect)
+                prev.union(rect)
+            });
+            self.frame.shadow_clip(max_shadow_rect)
         });
 
-        self.context.layer_manager.maybe_with_layer(
+        crate::layers::maybe_with_layer(
             scene,
-            needs_clip,
+            shadow_clip.as_ref(),
             1.0,
             self.transform,
-            &self.frame.shadow_clip(max_shadow_rect),
             None,
             None,
             |scene| {
@@ -53,13 +56,16 @@ impl ElementCx<'_, '_> {
 
                     let alpha = shadow_color.components[3];
                     if alpha != 0.0 {
-                        let transform = self.transform.then_translate(Vec2 {
+                        // acrender: the offset is in the element's space (pre_translate), so an ancestor's
+                        // scale / rotation applies to it too (upstream added it in screen space)
+                        let transform = self.transform.pre_translate(Vec2 {
                             x: shadow.base.horizontal.px() as f64 * self.scale,
                             y: shadow.base.vertical.px() as f64 * self.scale,
                         });
 
                         let spread = shadow.spread.px() as f64 * self.scale;
-                        let blur = shadow.base.blur.px() as f64;
+                        // acrender: scaled like the offset and spread (upstream used CSS px)
+                        let blur = shadow.base.blur.px() as f64 * self.scale;
 
                         // Without blur or spread the shadow is exactly the element's shape,
                         // so fill the border box path directly (preserving individual radii)
@@ -75,7 +81,15 @@ impl ElementCx<'_, '_> {
                         }
 
                         // TODO draw shadows with matching individual radii instead of averaging
+                        // acrender: per CSS Backgrounds 3 the spread grows the corner radius too (a square
+                        // corner stays square); upstream kept the unspread radius, so a round dot's
+                        // `0 0 0 6px` ring came out as a square
                         let radius = self.frame.border_radii.average();
+                        let radius = if radius > 0.0 {
+                            (radius + spread).max(0.0)
+                        } else {
+                            0.0
+                        };
                         let rect = self.frame.border_box.inflate(spread, spread);
 
                         // Fill the color
@@ -96,21 +110,24 @@ impl ElementCx<'_, '_> {
 
         let padding_box = self.frame.padding_box_path();
 
-        for shadow in box_shadow.iter().filter(|s| s.inset) {
+        // acrender: the first shadow is on top (CSS Backgrounds 3), so paint them last to first like the outset ones
+        for shadow in box_shadow.iter().filter(|s| s.inset).rev() {
             let shadow_color = shadow
                 .base
                 .color
                 .resolve_to_absolute(&current_color)
                 .as_srgb_color();
+            // acrender: skip just this one (upstream returned, dropping the shadows after it)
             if shadow_color == Color::TRANSPARENT {
-                return;
+                continue;
             }
 
             // TODO draw shadows with matching individual radii instead of averaging
             let radius = self.frame.border_radii.average();
-            let transform = self.transform.then_translate(Vec2 {
-                x: shadow.base.horizontal.px() as f64,
-                y: shadow.base.vertical.px() as f64,
+            // acrender: in the element's space, see the outset shadow; scaled (upstream used CSS px)
+            let transform = self.transform.pre_translate(Vec2 {
+                x: shadow.base.horizontal.px() as f64 * self.scale,
+                y: shadow.base.vertical.px() as f64 * self.scale,
             });
 
             scene.push_layer(

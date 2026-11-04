@@ -16,8 +16,8 @@ use style::values::computed::length_percentage::CalcLengthPercentage;
 use stylo_taffy::TaffyStyloStyle;
 use taffy::{
     AxisStaticEdge, AxisStaticPosition, BlockContext, CoreStyle as _, DetailedLayoutInfo,
-    FlexDirection, LayoutContainingBlock, LayoutPartialTree, MaybeMath as _, NodeId, OofCandidate,
-    ResolveOrZero, RoundTree, RunMode, TraversePartialTree, TraverseTree, compute_block_layout,
+    LayoutContainingBlock, LayoutPartialTree, MaybeMath as _, NodeId, OofCandidate, ResolveOrZero,
+    RoundTree, RunMode, TraversePartialTree, TraverseTree, compute_block_layout,
     compute_cached_layout, compute_flexbox_layout, compute_grid_layout, compute_leaf_layout,
     compute_oof_layout, prelude::*,
 };
@@ -317,10 +317,12 @@ impl LayoutPassState<'_> {
                             .and_then(|el| el.text_input_data_mut())
                         {
                             input.editor.set_width(Some(content_width * scale));
-                            input.editor.refresh_layout(
-                                &mut doc.font_ctx.lock().unwrap(),
-                                &mut doc.layout_ctx,
-                            );
+                            let font_ctx = &mut doc.font_ctx.lock().unwrap();
+                            input.editor.refresh_layout(font_ctx, &mut doc.layout_ctx);
+                            if let Some(placeholder) = input.placeholder.as_mut() {
+                                placeholder.set_width(Some(content_width * scale));
+                                placeholder.refresh_layout(font_ctx, &mut doc.layout_ctx);
+                            }
                         }
                     }
                     return output;
@@ -430,43 +432,8 @@ impl LayoutPassState<'_> {
                             }
                             ImageData::None => (IntrinsicSizes::default(), taffy::Size::ZERO),
                         },
-                        SpecialElementData::Canvas(_)
-                        | SpecialElementData::SubDocument(_)
-                        | SpecialElementData::None => {
+                        SpecialElementData::SubDocument(_) | SpecialElementData::None => {
                             tag_intrinsic_sizes(&element_data.name.local, attr_size)
-                        }
-                        #[cfg(feature = "custom-widget")]
-                        SpecialElementData::CustomWidget(widget_data) => {
-                            let (fallback, default_object_size) =
-                                tag_intrinsic_sizes(&element_data.name.local, attr_size);
-                            // A canvas's content attributes determine its intrinsic size,
-                            // overriding the widget-reported one; the widget-reported size
-                            // in turn overrides the tag's fallback.
-                            let attr_intrinsic =
-                                if *element_data.name.local == local_name!("canvas") {
-                                    attr_size
-                                } else {
-                                    taffy::Size::NONE
-                                };
-                            let attr_ratio = match (attr_intrinsic.width, attr_intrinsic.height) {
-                                (Some(w), Some(h)) => Some(w / h),
-                                _ => None,
-                            };
-                            let widget_sizes = widget_data.widget.intrinsic_sizes();
-                            (
-                                IntrinsicSizes {
-                                    width: attr_intrinsic
-                                        .width
-                                        .or(widget_sizes.width)
-                                        .or(fallback.width),
-                                    height: attr_intrinsic
-                                        .height
-                                        .or(widget_sizes.height)
-                                        .or(fallback.height),
-                                    ratio: attr_ratio.or(widget_sizes.ratio).or(fallback.ratio),
-                                },
-                                default_object_size,
-                            )
                         }
                         _ => unreachable!(),
                     };
@@ -859,86 +826,15 @@ impl RoundTree for LayoutPassState<'_> {
     }
 
     fn hoisted_child_count(&self, node_id: NodeId) -> usize {
-        self.node_from_id(node_id).hoisted_children.borrow().len()
+        // acrender: a box claimed by another containing block, then removed, is scrubbed from that one
+        // only; a containing block that was not laid out again still lists it (closing CodeMirror)
+        let mut hoisted = self.node_from_id(node_id).hoisted_children.borrow_mut();
+        hoisted.retain(|id| self.nodes.contains_key(*id));
+        hoisted.len()
     }
 
     fn get_hoisted_child_id(&self, node_id: NodeId, index: usize) -> NodeId {
         taffy_node_id(self.node_from_id(node_id).hoisted_children.borrow()[index])
-    }
-}
-
-pub(crate) struct TaffyDebugTree<'doc>(pub(crate) &'doc BaseDocument);
-
-impl TaffyDebugTree<'_> {
-    fn node_from_id(&self, node_id: NodeId) -> &Node {
-        &self.0.nodes[dom_node_id(node_id)]
-    }
-}
-
-impl TraversePartialTree for TaffyDebugTree<'_> {
-    type ChildIter<'a>
-        = RefCellChildIter<'a>
-    where
-        Self: 'a;
-
-    fn child_ids(&self, node_id: NodeId) -> Self::ChildIter<'_> {
-        let layout_children = self.node_from_id(node_id).layout_children.borrow();
-        RefCellChildIter::new(Ref::map(layout_children, |children| {
-            children.as_ref().map(|c| c.as_slice()).unwrap_or(&[])
-        }))
-    }
-
-    fn child_count(&self, node_id: NodeId) -> usize {
-        self.node_from_id(node_id)
-            .layout_children
-            .borrow()
-            .as_ref()
-            .map(|c| c.len())
-            .unwrap_or(0)
-    }
-
-    fn get_child_id(&self, node_id: NodeId, index: usize) -> NodeId {
-        taffy_node_id(
-            self.node_from_id(node_id)
-                .layout_children
-                .borrow()
-                .as_ref()
-                .unwrap()[index],
-        )
-    }
-}
-
-impl TraverseTree for TaffyDebugTree<'_> {}
-
-impl PrintTree for TaffyDebugTree<'_> {
-    fn get_debug_label(&self, node_id: NodeId) -> &'static str {
-        let node = &self.node_from_id(node_id);
-
-        match node.data {
-            NodeData::Document(_) => "DOCUMENT",
-            // NodeData::Doctype { .. } => return "DOCTYPE",
-            NodeData::Text { .. } => node.node_debug_str().leak(),
-            NodeData::Comment { .. } => "COMMENT",
-            NodeData::AnonymousBlock(_) => "ANONYMOUS BLOCK",
-            NodeData::Element(_) => {
-                let style = node.layout_style();
-                let display = match node.taffy_display() {
-                    Display::Flex => match taffy::FlexboxContainerStyle::flex_direction(&style) {
-                        FlexDirection::Row | FlexDirection::RowReverse => "FLEX ROW",
-                        FlexDirection::Column | FlexDirection::ColumnReverse => "FLEX COL",
-                    },
-                    Display::Grid => "GRID",
-                    Display::Block => "BLOCK",
-                    Display::FlowRoot => "FLOW ROOT",
-                    Display::None => "NONE",
-                };
-                format!("{} ({})", node.node_debug_str(), display).leak()
-            } // NodeData::ProcessingInstruction { .. } => return "PROCESSING INSTRUCTION",
-        }
-    }
-
-    fn get_final_layout(&self, node_id: NodeId) -> Layout {
-        *self.node_from_id(node_id).final_layout()
     }
 }
 

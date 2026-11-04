@@ -16,8 +16,8 @@ use style::shared_lock::StylesheetGuards;
 use style::url::ComputedUrl;
 use style::values::generics::image::Image as StyloImage;
 use style::values::specified::align::AlignFlags;
-use style::values::specified::box_::DisplayInside;
 use style::values::specified::box_::DisplayOutside;
+use style::values::specified::box_::{Display, DisplayInside};
 use thin_vec::ThinVec;
 
 // Blitz-specific damage bits, in increasing order of severity above Servo's
@@ -63,6 +63,10 @@ impl BaseDocument {
             return RestyleDamage::empty();
         };
         let mut damage = own_damage;
+
+        if !own_damage.is_empty() {
+            self.repaint_inline_root(node_id);
+        }
 
         // Skip subtrees which contain no damage. Anonymous nodes are never
         // skipped themselves because damage marking walks the DOM parent
@@ -111,6 +115,26 @@ impl BaseDocument {
         // Compute damage to propagate to parent
         let mut damage_for_parent = damage; // & RestyleDamage::RELAYOUT;
 
+        // acrender: a change inside an inline `<svg>` (an animated face sets `d` every frame) rebuilds
+        // just the `<svg>` (below). Its box and size come from the `<svg>` element alone, so its
+        // ancestors only repaint; upstream passed the descendants' damage on, reconstructing and
+        // relaying out every ancestor up to the root.
+        #[cfg(feature = "svg")]
+        let is_svg = self.nodes[node_id]
+            .data
+            .is_element_with_tag_name(&local_name!("svg"));
+        #[cfg(feature = "svg")]
+        if is_svg {
+            damage_for_parent = own_damage | (damage_from_children & RestyleDamage::REPAINT);
+            if own_damage.contains(CONSTRUCT_BOX) {
+                damage_for_parent.insert(RestyleDamage::RELAYOUT);
+            }
+            // The `<svg>` is rebuilt (below): resolve_layout_children has to get down to it
+            if !damage.is_empty() {
+                damage_for_parent.insert(CONSTRUCT_DESCENDENT);
+            }
+        }
+
         if reorder {
             damage.insert(CONSTRUCT_BOX);
             damage_for_parent.insert(CONSTRUCT_DESCENDENT);
@@ -120,11 +144,7 @@ impl BaseDocument {
         // `currentColor` resolved) taken during box construction, so it must be
         // rebuilt whenever the style of the `<svg>` or any descendant changes.
         #[cfg(feature = "svg")]
-        if !damage.is_empty()
-            && self.nodes[node_id]
-                .data
-                .is_element_with_tag_name(&local_name!("svg"))
-        {
+        if !damage.is_empty() && is_svg {
             damage.insert(CONSTRUCT_BOX);
         }
 
@@ -192,6 +212,38 @@ impl BaseDocument {
 
         // Propagate damage to parent
         damage_for_parent
+    }
+
+    /// acrender: an inline element (not an inline box) is painted as part of its inline root's text:
+    /// the painter never visits it, so the paint cache only sees the root. A change in its style
+    /// (a color with no relayout) bumps the root's `paint_epoch`.
+    fn repaint_inline_root(&mut self, node_id: NodeId) {
+        let inline_content = |node: &Node| {
+            node.element_data()
+                .is_some_and(|e| !crate::layout::replaced::is_inline_box_element(&e.name.local))
+                && node.display_style().is_some_and(|d| {
+                    d.outside() == DisplayOutside::Inline && d.inside() == DisplayInside::Flow
+                })
+        };
+        if !inline_content(&self.nodes[node_id]) {
+            return;
+        }
+        let mut current = self.nodes[node_id].layout_parent.get();
+        while let Some(id) = current {
+            let Some(node) = self.nodes.get_mut(id) else {
+                return;
+            };
+            if node.flags.is_inline_root() {
+                if let Some(element) = node.element_data_mut() {
+                    element.repaint();
+                }
+                return;
+            }
+            if !inline_content(node) {
+                return;
+            }
+            current = node.layout_parent.get();
+        }
     }
 
     /// Refresh owned anonymous boxes without revisiting their DOM children.
@@ -301,6 +353,15 @@ impl BaseDocument {
         let is_anonymous = node.is_anonymous();
         let has_damage = node.damage().is_some_and(|d| !d.is_empty());
         if !has_damage && !node.has_damaged_descendants() && !is_anonymous {
+            return;
+        }
+        // acrender: nothing under `display: none` was constructed, so its construction damage is still
+        // owed: cleared here, a subtree shown again with unchanged styles (a window opened after
+        // starting `hidden`) never built its inline SVGs and text inputs
+        if node.display_style().is_some_and(|d| d == Display::None) {
+            node.clear_damage_mut();
+            node.unset_damaged_descendants();
+            node.unset_dirty_descendants();
             return;
         }
         let anonymous_blocks = std::mem::take(&mut node.anonymous_blocks);
@@ -506,6 +567,10 @@ impl BaseDocument {
                 input.editor.set_scale(scale);
                 let mut font_ctx = font_ctx.lock().unwrap();
                 input.editor.refresh_layout(&mut font_ctx, layout_ctx);
+                if let Some(placeholder) = input.placeholder.as_mut() {
+                    placeholder.set_scale(scale);
+                    placeholder.refresh_layout(&mut font_ctx, layout_ctx);
+                }
                 node.insert_damage(ONLY_RELAYOUT);
             }
         }
@@ -566,6 +631,7 @@ impl BaseDocument {
 
         let len = style_images.len();
         elem_images.resize(len, None);
+        elem.paint_epoch += 1; // acrender: see ElementData::repaint
 
         for idx in 0..len {
             let style_image = &style_images[idx];

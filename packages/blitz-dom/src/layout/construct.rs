@@ -20,7 +20,7 @@ use crate::{
     layout::damage::{
         CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC, sort_layout_children_by_order,
     },
-    node::{NodeFlags, NodeKind, SpecialElementData, TextInputData, TextLayout},
+    node::{NodeFlags, NodeKind, SpecialElementData, TextBrush, TextInputData, TextLayout},
     qual_name, stylo_to_parley,
     traversal::{iter_children, iter_children_and_pseudos},
 };
@@ -450,27 +450,49 @@ fn collect_layout_children_with_wrap(
 
         #[cfg(feature = "svg")]
         if matches!(tag_name, "svg") {
-            let outer_html = doc.get_node(container_node_id).unwrap().svg_source();
+            // acrender: simple SVGs straight from the DOM, without writing and parsing the text (animated icons
+            // rebuild every frame); the text path for everything else
+            // acrender: <text> is set in the document's fonts (its @font-face ones first, see svg_fonts)
+            let fonts = doc
+                .has_descendant(container_node_id, "text")
+                .then(|| doc.svg_fonts());
+            let parse = |s: &[u8]| crate::util::parse_svg_with(s, fonts.clone());
+            let node = doc.get_node(container_node_id).unwrap();
+            let svg = doc
+                .svg_from_dom
+                .then(|| crate::node::SvgImageData::simple_dom(node, node.svg_viewport(), parse))
+                .flatten();
+            let parsed = match svg {
+                Some(svg) => {
+                    if std::env::var_os("ACRENDER_SVG_PATH").is_some() {
+                        eprintln!("acrender svg path: dom");
+                    }
+                    Ok(svg)
+                }
+                None => crate::util::parse_svg_image(node.svg_source().as_bytes(), fonts),
+            };
 
             // Remove contruction damage from subtree
             doc.iter_subtree_mut(container_node_id, |id: NodeId, doc: &mut BaseDocument| {
                 doc.nodes[id].remove_damage(CONSTRUCT_BOX | CONSTRUCT_DESCENDENT | CONSTRUCT_FC);
             });
 
-            match crate::util::parse_svg_image(outer_html.as_bytes()) {
+            match parsed {
                 Ok(svg) => {
-                    doc.get_node_mut(container_node_id)
+                    let element = doc
+                        .get_node_mut(container_node_id)
                         .unwrap()
                         .element_data_mut()
-                        .unwrap()
-                        .special_data =
+                        .unwrap();
+                    element.special_data =
                         SpecialElementData::Image(Box::new(crate::node::ImageData::Svg(svg)));
+                    element.repaint(); // acrender
                 }
                 Err(err) => {
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
                         node_id = ?container_node_id,
-                        html = outer_html,
+                        html = doc.get_node(container_node_id).unwrap().svg_source(),
                         error = ?err,
                         "SVG parse failed",
                     );
@@ -563,11 +585,12 @@ fn collect_layout_children_with_wrap(
             doc.nodes[container_node_id]
                 .flags
                 .insert(NodeFlags::IS_TABLE_ROOT);
-            doc.nodes[container_node_id]
+            let element = doc.nodes[container_node_id]
                 .data
                 .downcast_element_mut()
-                .unwrap()
-                .special_data = data;
+                .unwrap();
+            element.special_data = data;
+            element.repaint(); // acrender
             if let Some(before) = doc.nodes[container_node_id].before() {
                 out.push(before, doc);
             }
@@ -866,6 +889,10 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
     } else {
         node.attr(local_name!("value")).unwrap_or("").to_string()
     };
+    let placeholder = node
+        .attr(local_name!("placeholder"))
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned);
     let element = &mut node.data.downcast_element_mut().unwrap();
     if !matches!(element.special_data, SpecialElementData::TextInput(_)) {
         let mut text_input_data = TextInputData::new(is_multiline);
@@ -878,33 +905,53 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
         unreachable!();
     };
 
-    let editor = &mut text_input_data.editor;
-    editor.set_scale(doc.viewport.scale_f64() as f32);
-    editor.set_width(None);
+    let scale = doc.viewport.scale_f64() as f32;
+    let configure = |editor: &mut parley::PlainEditor<TextBrush>| {
+        editor.set_scale(scale);
+        editor.set_width(None);
 
-    let styles = editor.edit_styles();
-    styles.retain(|_| false);
-    styles.insert(StyleProperty::FontFamily(parley_style.font_family));
-    styles.insert(StyleProperty::FontSize(parley_style.font_size));
-    styles.insert(StyleProperty::FontWidth(parley_style.font_width));
-    styles.insert(StyleProperty::FontStyle(parley_style.font_style));
-    styles.insert(StyleProperty::FontWeight(parley_style.font_weight));
-    styles.insert(StyleProperty::FontVariations(parley_style.font_variations));
-    styles.insert(StyleProperty::FontFeatures(parley_style.font_features));
-    styles.insert(StyleProperty::LineHeight(parley_style.line_height));
-    styles.insert(StyleProperty::WordSpacing(parley_style.word_spacing));
-    styles.insert(StyleProperty::LetterSpacing(parley_style.letter_spacing));
-    styles.insert(StyleProperty::WordBreak(parley_style.word_break));
-    styles.insert(StyleProperty::OverflowWrap(parley_style.overflow_wrap));
-    styles.insert(StyleProperty::TextWrapMode(parley_style.text_wrap_mode));
-    styles.insert(StyleProperty::WhiteSpaceCollapse(
-        parley_style.white_space_collapse,
-    ));
-    styles.insert(StyleProperty::Brush(parley_style.brush));
-    editor.set_alignment(alignment);
-    editor.set_base_direction(base_direction);
+        let styles = editor.edit_styles();
+        styles.retain(|_| false);
+        styles.insert(StyleProperty::FontFamily(parley_style.font_family.clone()));
+        styles.insert(StyleProperty::FontSize(parley_style.font_size));
+        styles.insert(StyleProperty::FontWidth(parley_style.font_width));
+        styles.insert(StyleProperty::FontStyle(parley_style.font_style));
+        styles.insert(StyleProperty::FontWeight(parley_style.font_weight));
+        styles.insert(StyleProperty::FontVariations(
+            parley_style.font_variations.clone(),
+        ));
+        styles.insert(StyleProperty::FontFeatures(
+            parley_style.font_features.clone(),
+        ));
+        styles.insert(StyleProperty::LineHeight(parley_style.line_height));
+        styles.insert(StyleProperty::WordSpacing(parley_style.word_spacing));
+        styles.insert(StyleProperty::LetterSpacing(parley_style.letter_spacing));
+        styles.insert(StyleProperty::WordBreak(parley_style.word_break));
+        styles.insert(StyleProperty::OverflowWrap(parley_style.overflow_wrap));
+        styles.insert(StyleProperty::TextWrapMode(parley_style.text_wrap_mode));
+        styles.insert(StyleProperty::WhiteSpaceCollapse(
+            parley_style.white_space_collapse,
+        ));
+        styles.insert(StyleProperty::Brush(parley_style.brush));
+        // acrender: the language picks CJK fallback variants (zh-Hans puts a full-width colon at the left)
+        styles.insert(StyleProperty::Locale(parley_style.locale));
+        editor.set_alignment(alignment);
+        editor.set_base_direction(base_direction);
+    };
+    configure(&mut text_input_data.editor);
+    // acrender: the placeholder is laid out like the value (its colour comes from `::placeholder` at paint time)
+    text_input_data.placeholder = placeholder.map(|text| {
+        let mut editor = Box::new(parley::PlainEditor::new(16.0));
+        editor.set_text(&text);
+        configure(&mut editor);
+        editor
+    });
 
-    editor.refresh_layout(&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx);
+    let (font_ctx, layout_ctx) = (&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx);
+    text_input_data.editor.refresh_layout(font_ctx, layout_ctx);
+    if let Some(placeholder) = text_input_data.placeholder.as_mut() {
+        placeholder.refresh_layout(font_ctx, layout_ctx);
+    }
 }
 
 fn create_checkbox_input(doc: &mut BaseDocument, input_element_id: NodeId) {
@@ -940,7 +987,10 @@ pub(crate) fn find_inline_layout_embedded_boxes(
     fn flush_inline_pseudos_recursive(doc: &mut BaseDocument, node_id: NodeId) {
         doc.iter_children_mut(node_id, |child_id, doc| {
             flush_pseudo_elements(doc, child_id);
-            let display = doc.nodes[node_id]
+            // acrender: recurse on the child's display, not the parent's
+            // (upstream read `node_id`, so nested inline elements' pseudos
+            // were never built)
+            let display = doc.nodes[child_id]
                 .display_style()
                 .unwrap_or(Display::inline());
             let do_recurse = match (display.outside(), display.inside()) {

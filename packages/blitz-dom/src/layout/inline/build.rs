@@ -114,6 +114,21 @@ pub(crate) fn build_inline_layout_into(
     }
 
     text_layout.text = builder.build_into(&mut text_layout.layout);
+    text_layout.generation = nodes.next_text_generation(); // acrender
+
+    // acrender: `text-overflow: ellipsis` marker, see `TextLayout::ellipsis`
+    let ellipsis = root_node_style.as_deref().is_some_and(|s| {
+        s.get_text().text_overflow.second
+            == style::values::specified::text::TextOverflowSide::Ellipsis
+    }) || crate::webkit_compat::line_clamp(nodes, inline_context_root_node_id)
+        .is_some();
+    text_layout.ellipsis = ellipsis.then(|| {
+        let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
+        builder.push_text("\u{2026}");
+        let mut layout = builder.build().0;
+        layout.break_all_lines(None);
+        layout
+    });
     return;
 
     fn build_inline_layout_recursive(
@@ -231,6 +246,23 @@ pub(crate) fn build_inline_layout_into(
                                 });
 
                             builder.push_style_span(style);
+                            // acrender: padding / border / margin of the span (see node::InlineEdge)
+                            let edges = node
+                                .primary_styles()
+                                .is_some_and(|s| crate::node::InlineEdge::needed(&s));
+                            let edge = |end: bool| InlineBox {
+                                id: crate::node::InlineEdge { node: node_id, end }.id(),
+                                kind: InlineBoxKind::InFlow,
+                                index: 0,
+                                // Set during layout
+                                width: 0.0,
+                                height: 0.0,
+                                baseline: None,
+                                vertical_align: Default::default(),
+                            };
+                            if edges {
+                                builder.push_inline_box(edge(false));
+                            }
 
                             if let Some(before_id) = node.before() {
                                 build_inline_layout_recursive(
@@ -259,6 +291,9 @@ pub(crate) fn build_inline_layout_into(
                                     after_id,
                                     &text_transform,
                                 );
+                            }
+                            if edges {
+                                builder.push_inline_box(edge(true));
                             }
 
                             builder.pop_style_span();

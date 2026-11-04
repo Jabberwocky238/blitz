@@ -41,6 +41,11 @@ pub struct NodeTree {
     /// Scroll offset of the viewport (the root element scrolls the viewport,
     /// so its offset lives here rather than on the node).
     viewport_scroll: crate::Point<f64>,
+    /// acrender: `DocumentConfig::default_lang`
+    pub(crate) default_lang: Option<String>,
+    /// acrender: source of `TextLayout::generation` values (unique across layouts: a rebuilt layout
+    /// is a new object, so a per-layout counter would repeat)
+    text_generation: AtomicU64,
 }
 
 impl NodeTree {
@@ -49,7 +54,15 @@ impl NodeTree {
             map: SlotMap::with_key(),
             geometry_generation: AtomicU64::new(1),
             viewport_scroll: crate::Point::ZERO,
+            default_lang: None,
+            text_generation: AtomicU64::new(1),
         }
+    }
+
+    /// acrender: a fresh `TextLayout::generation` value
+    pub(crate) fn next_text_generation(&self) -> u64 {
+        self.text_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn viewport_scroll(&self) -> crate::Point<f64> {

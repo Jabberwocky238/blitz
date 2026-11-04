@@ -1,7 +1,7 @@
 use super::{ElementCx, to_image_quality, to_peniko_image};
 use crate::color::{Color, ToColorColor};
 use crate::gradient::to_peniko_gradient;
-use anyrender::PaintScene;
+use acgpu::PaintScene;
 use blitz_dom::NodeId;
 use blitz_dom::node::{ImageData, ImageResourceData, SpecialElementData};
 use kurbo::{self, Affine, BezPath, Point, Rect, Shape, Size, Vec2};
@@ -141,10 +141,10 @@ impl ElementCx<'_, '_> {
         // The background color is clipped by the clip of the last layer in the list
         let background_clip: BoxModelBox =
             (*get_cyclic(&bg_styles.background_clip.0, layer_count - 1)).into();
-        let background_clip_path = self.box_path(background_clip);
 
         // Draw background color (if any)
-        self.draw_solid_bg(scene, &background_clip_path);
+        // acrender: the clip path only when there is a color to fill
+        self.draw_solid_bg(scene, || self.box_path(background_clip));
 
         for idx in (0..layer_count).rev() {
             let layer = ImageLayerStyles::from_background(bg_styles, image_data, idx);
@@ -153,12 +153,11 @@ impl ElementCx<'_, '_> {
             }
             let background_clip_path = self.box_path(layer.clip);
 
-            self.context.layer_manager.maybe_with_layer(
+            crate::layers::maybe_with_layer(
                 scene,
-                true,
+                Some(&background_clip_path),
                 1.0,
                 self.transform,
-                &background_clip_path,
                 None,
                 None,
                 |scene| {
@@ -170,6 +169,10 @@ impl ElementCx<'_, '_> {
 
     /// The path of the given CSS box model box for this element
     pub(super) fn box_path(&self, css_box: BoxModelBox) -> BezPath {
+        // acrender: the canvas background is clipped to the whole canvas
+        if let Some(canvas) = self.canvas {
+            return canvas.to_path(0.1);
+        }
         match css_box {
             BoxModelBox::BorderBox => self.frame.border_box_path(),
             BoxModelBox::PaddingBox => self.frame.padding_box_path(),
@@ -184,6 +187,11 @@ impl ElementCx<'_, '_> {
             BoxModelBox::PaddingBox => self.frame.padding_box,
             BoxModelBox::ContentBox => self.frame.content_box,
         }
+    }
+
+    /// acrender: the area a layer paints (its clip box); the whole canvas for the canvas background
+    fn clip_rect(&self, css_box: BoxModelBox) -> Rect {
+        self.canvas.unwrap_or_else(|| self.box_rect(css_box))
     }
 
     /// Draw a single layer of a CSS image layer list (`background-image` or `mask-image`)
@@ -330,7 +338,7 @@ impl ElementCx<'_, '_> {
         }
     }
 
-    fn draw_solid_bg(&self, scene: &mut impl PaintScene, shape: &BezPath) {
+    fn draw_solid_bg(&self, scene: &mut impl PaintScene, shape: impl FnOnce() -> BezPath) {
         let current_color = self.style.clone_color();
         let background_color = &self.style.get_background().background_color;
         let bg_color = background_color
@@ -339,7 +347,7 @@ impl ElementCx<'_, '_> {
 
         if bg_color != Color::TRANSPARENT {
             // Fill the color
-            scene.fill(Fill::NonZero, self.transform, bg_color, None, shape);
+            scene.fill(Fill::NonZero, self.transform, bg_color, None, &shape());
         }
     }
 
@@ -452,7 +460,7 @@ impl ElementCx<'_, '_> {
             ))
             * viewport;
 
-        anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
+        crate::svg::SvgPainter::draw(scene, &svg.tree, transform);
     }
 
     fn draw_raster_image_layer(&self, scene: &mut impl PaintScene, layer: &ImageLayerStyles) {
@@ -490,10 +498,12 @@ impl ElementCx<'_, '_> {
 
         let BackgroundRepeat(repeat_x, repeat_y) = layer.repeat;
 
+        let clip_rect = self.clip_rect(layer.clip);
         let x = raster_axis_tiling(
             *repeat_x,
             origin_rect.x0,
             origin_rect.width(),
+            (clip_rect.x0, clip_rect.width()),
             bg_pos.x,
             bg_size.width,
             image_width,
@@ -503,26 +513,29 @@ impl ElementCx<'_, '_> {
             *repeat_y,
             origin_rect.y0,
             origin_rect.height(),
+            (clip_rect.y0, clip_rect.height()),
             bg_pos.y,
             bg_size.height,
             image_height,
             y_ratio,
         );
 
-        let transform = base_transform
-            .pre_scale_non_uniform(x_ratio, y_ratio)
-            .then_translate(Vec2 {
-                x: x.translate,
-                y: y.translate,
-            });
+        // acrender: tile offsets in the element's space (upstream added them in screen space, so an
+        // ancestor's scale / rotation didn't apply to them)
+        let transform = base_transform.pre_translate(Vec2 {
+            x: x.translate,
+            y: y.translate,
+        });
         let tile_rect = Rect::new(0.0, 0.0, x.rect_len, y.rect_len);
 
         for hc in 0..y.count {
             for wc in 0..x.count {
-                let transform = transform.then_translate(Vec2 {
-                    x: wc as f64 * x.stride,
-                    y: hc as f64 * y.stride,
-                });
+                let transform = transform
+                    .pre_translate(Vec2 {
+                        x: wc as f64 * x.stride,
+                        y: hc as f64 * y.stride,
+                    })
+                    .pre_scale_non_uniform(x_ratio, y_ratio);
 
                 scene.fill(
                     peniko::Fill::NonZero,
@@ -551,7 +564,7 @@ impl ElementCx<'_, '_> {
             (
                 self.box_rect(layer.origin),
                 self.transform,
-                self.box_rect(layer.clip),
+                self.clip_rect(layer.clip),
             )
         };
 
@@ -602,16 +615,17 @@ impl ElementCx<'_, '_> {
             self.scale,
             &current_color,
         );
-        let brush = anyrender::Paint::Gradient(&gradient);
+        let brush = acgpu::Paint::Gradient(&gradient);
 
-        let transform = base_transform.then_translate(Vec2 {
+        // acrender: tile offsets in the element's space, as for raster layers
+        let transform = base_transform.pre_translate(Vec2 {
             x: x.translate,
             y: y.translate,
         });
 
         for hc in 0..y.count {
             for wc in 0..x.count {
-                let transform = transform.then_translate(Vec2 {
+                let transform = transform.pre_translate(Vec2 {
                     x: wc as f64 * x.stride,
                     y: hc as f64 * y.stride,
                 });
@@ -839,10 +853,12 @@ struct AxisTiling {
 ///
 /// The fill rect is in image pixel coordinates (the drawing transform is
 /// pre-scaled by `ratio`), while translations are in device pixels.
+#[allow(clippy::too_many_arguments)]
 fn raster_axis_tiling(
     repeat: BackgroundRepeatKeyword,
     origin_start: f64,
     origin_len: f64,
+    (clip_start, clip_len): (f64, f64),
     bg_pos: f64,
     tile_len: f64,
     image_len: f64,
@@ -852,10 +868,19 @@ fn raster_axis_tiling(
 
     match repeat {
         Repeat | Round => {
-            let extend_len = extend(bg_pos, tile_len);
+            // acrender: like gradients, cover the clip box when it extends beyond the origin box
+            // (the canvas background is positioned against the root box but paints the canvas)
+            let clip_is_outer =
+                clip_start < origin_start || clip_start + clip_len > origin_start + origin_len;
+            let (area_start, area_len) = if clip_is_outer {
+                (clip_start, clip_len)
+            } else {
+                (origin_start, origin_len)
+            };
+            let extend_len = extend((origin_start - area_start) + bg_pos, tile_len);
             AxisTiling {
-                translate: origin_start - extend_len,
-                rect_len: (origin_len + extend_len) / ratio,
+                translate: area_start - extend_len,
+                rect_len: (area_len + extend_len) / ratio,
                 count: 1,
                 stride: 0.0,
             }

@@ -176,6 +176,12 @@ impl StackingContext {
         area
     }
 
+    /// acrender: drop a removed node
+    pub(crate) fn forget(&mut self, node_id: NodeId) {
+        self.children.retain(|c| c.node_id != node_id);
+        self.negative_z_count = self.children.iter().take_while(|c| c.z_index < 0).count() as u32;
+    }
+
     pub fn sort(&mut self) {
         self.children.sort_by_key(|c| c.z_index);
         self.negative_z_count = self.children.iter().take_while(|c| c.z_index < 0).count() as u32;
