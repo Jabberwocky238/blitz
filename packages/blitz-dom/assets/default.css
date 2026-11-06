@@ -92,6 +92,14 @@ button {
     font-family: system-ui, sans-serif;
 }
 
+/* acrender: form controls draw in FieldText / ButtonText, not the page's colour (Firefox and Chrome) */
+input,
+textarea,
+select,
+button {
+    color: black;
+}
+
 textarea {
     font-family: monospace;
 }

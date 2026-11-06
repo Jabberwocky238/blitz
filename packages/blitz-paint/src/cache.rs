@@ -14,8 +14,8 @@
 //! are re-recorded every frame.
 use std::collections::HashMap;
 
-use acgpu::RenderCommand;
-use acgpu::Scene;
+use acde_gpu::Scene;
+use acde_gpu::RenderCommand;
 use blitz_dom::node::{NodeData, SpecialElementData};
 use blitz_dom::{BaseDocument, Node, NodeId};
 use kurbo::{Affine, Point, Rect, Vec2};

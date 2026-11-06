@@ -1,5 +1,5 @@
-//! Paint a [`blitz_dom::BaseDocument`] by pushing drawing commands into an impl of acgpu's
-//! [`acgpu::PaintScene`] (acrender: the 2D scene is acgpu's, anyrender is gone).
+//! Paint a [`blitz_dom::BaseDocument`] by pushing drawing commands into an impl of
+//! [`acde_gpu::PaintScene`] (acrender: the 2D scene is acdert's acde-gpu, anyrender is gone).
 
 #![allow(clippy::collapsible_if)]
 
@@ -17,7 +17,7 @@ mod text;
 
 use std::collections::HashSet;
 
-use acgpu::{PaintScene, Scene};
+use acde_gpu::{PaintScene, Scene};
 use blitz_dom::{BaseDocument, NodeId, util::Color};
 use render::BlitzDomPainter;
 
@@ -34,7 +34,7 @@ const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
 const SELECTION_COLOR: Color = Color::from_rgb8(180, 213, 255);
 
 /// Paint a [`blitz_dom::BaseDocument`] by pushing drawing commands into
-/// an impl [`acgpu::PaintScene`].
+/// an impl [`acde_gpu::PaintScene`].
 ///
 /// This function assumes that the styles and layout in the [`BaseDocument`] are already
 /// resolved. Please ensure that this is the case before trying to paint.

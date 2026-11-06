@@ -999,8 +999,9 @@ impl<'doc> DocumentMutator<'doc> {
         }
 
         // Add/Update inline stylesheets (<style> elements)
+        // acrender: only <style> elements in the document (not a DOMParser / template / detached one) style it
         for id in self.style_nodes.drain() {
-            if self.doc.get_node(id).is_some() {
+            if self.doc.get_node(id).is_some_and(|n| n.flags.is_in_document()) {
                 self.doc.process_style_element(id);
             }
         }

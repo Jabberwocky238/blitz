@@ -63,7 +63,7 @@ thin-vec = { workspace = true }
 # DioxusLabs dependencies
 taffy = { workspace = true }
 # acrender: always (canvas 2D pictures, see BaseDocument::set_canvas_picture)
-acgpu = { workspace = true }
+acde-gpu = { workspace = true }
 
 # Linebender/Fontations dependencies
 parley = { workspace = true }

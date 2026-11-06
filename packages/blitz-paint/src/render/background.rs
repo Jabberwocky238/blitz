@@ -1,7 +1,7 @@
 use super::{ElementCx, to_image_quality, to_peniko_image};
 use crate::color::{Color, ToColorColor};
 use crate::gradient::to_peniko_gradient;
-use acgpu::PaintScene;
+use acde_gpu::PaintScene;
 use blitz_dom::NodeId;
 use blitz_dom::node::{ImageData, ImageResourceData, SpecialElementData};
 use kurbo::{self, Affine, BezPath, Point, Rect, Shape, Size, Vec2};
@@ -615,7 +615,7 @@ impl ElementCx<'_, '_> {
             self.scale,
             &current_color,
         );
-        let brush = acgpu::Paint::Gradient(&gradient);
+        let brush = acde_gpu::Paint::Gradient(&gradient);
 
         // acrender: tile offsets in the element's space, as for raster layers
         let transform = base_transform.pre_translate(Vec2 {

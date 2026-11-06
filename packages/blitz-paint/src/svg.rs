@@ -1,10 +1,10 @@
-//! acrender: a usvg tree painted into acgpu's [`PaintScene`]. This was anyrender_svg 0.15 (Apache-2.0 OR MIT, the Vello
-//! authors); it moved here with the scene type when anyrender went (acgpu owns the scene now).
+//! acrender: a usvg tree painted into acde-gpu's [`PaintScene`]. This was anyrender_svg 0.15 (Apache-2.0 OR MIT, the Vello
+//! authors); it moved here with the scene type when anyrender went (acde-gpu owns the scene now).
 //!
 //! Missing, as before: masks, filter effects, patterns, group backgrounds; clip paths with more than one path. An
 //! unsupported node is drawn as a half-transparent red box.
 
-use acgpu::{Paint, PaintScene};
+use acde_gpu::{Paint, PaintScene};
 use kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Stroke};
 use peniko::color::{DynamicColor, palette};
 use peniko::{BlendMode, Blob, Color, ColorStop, Compose, Extend, Fill, Gradient, ImageAlphaType, ImageBrush, ImageData, ImageFormat, ImageQuality, Mix};

@@ -2,7 +2,7 @@ use blitz_dom::util::ToColorColor as _;
 use style::color::AbsoluteColor;
 pub(crate) use style::computed_values::filter::single_value::T as StyloFilter;
 
-use acgpu::{ColorMatrix, DropShadow, Filter, FilterEffect, GaussianBlur};
+use acde_gpu::{ColorMatrix, DropShadow, Filter, FilterEffect, GaussianBlur};
 
 pub(crate) fn convert_filters(filters: &[StyloFilter]) -> Option<Filter> {
     if filters.is_empty() {

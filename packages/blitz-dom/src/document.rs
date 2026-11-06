@@ -28,7 +28,7 @@ use selectors::{Element, matching::QuirksMode};
 use smallvec::SmallVec;
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, Bound, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -338,7 +338,7 @@ pub struct BaseDocument {
     pub(crate) sub_document_nodes: HashSet<NodeId>,
     /// acrender: what each `<canvas>` has drawn (2D context commands, in its bitmap's pixels), painted
     /// into its content box
-    pub(crate) canvas_pictures: HashMap<NodeId, Arc<acgpu::Scene>>,
+    pub(crate) canvas_pictures: HashMap<NodeId, Arc<acde_gpu::Scene>>,
     /// acrender: simple inline SVGs built straight from the DOM (see DocumentConfig::svg_text_only)
     pub(crate) svg_from_dom: bool,
     /// acrender: `DocumentConfig::skip_iframe_content`
@@ -1214,7 +1214,7 @@ impl BaseDocument {
     }
 
     /// acrender: what a `<canvas>` shows (`None`: nothing); the canvas is painted again
-    pub fn set_canvas_picture(&mut self, node_id: NodeId, picture: Option<Arc<acgpu::Scene>>) {
+    pub fn set_canvas_picture(&mut self, node_id: NodeId, picture: Option<Arc<acde_gpu::Scene>>) {
         match picture {
             Some(p) => _ = self.canvas_pictures.insert(node_id, p),
             None => _ = self.canvas_pictures.remove(&node_id),
@@ -1233,7 +1233,7 @@ impl BaseDocument {
         self.nodes.geometry_generation()
     }
 
-    pub fn canvas_picture(&self, node_id: NodeId) -> Option<&Arc<acgpu::Scene>> {
+    pub fn canvas_picture(&self, node_id: NodeId) -> Option<&Arc<acde_gpu::Scene>> {
         self.canvas_pictures.get(&node_id)
     }
 
@@ -1517,11 +1517,12 @@ impl BaseDocument {
         let element = &mut self.nodes[node_id].element_data_mut().unwrap();
         element.special_data = SpecialElementData::Stylesheet(stylesheet.clone());
 
-        // TODO: Nodes could potentially get reused so ordering by node_id might be wrong.
+        // acrender: sheets cascade in tree order, not node id order (a <link> whose href changes keeps its id)
         let insertion_point = self
             .nodes_to_stylesheet
-            .range((Bound::Excluded(node_id), Bound::Unbounded))
-            .next()
+            .iter()
+            .filter(|&(&id, _)| id != node_id && self.tree_order(id, node_id).is_gt())
+            .min_by(|&(&a, _), &(&b, _)| self.tree_order(a, b))
             .map(|(_, sheet)| sheet);
 
         if let Some(insertion_point) = insertion_point {
@@ -1533,6 +1534,34 @@ impl BaseDocument {
         } else {
             self.stylist
                 .append_stylesheet(stylesheet, &self.guard.read())
+        }
+    }
+
+    // acrender: document order of two nodes; nodes in different trees fall back to id order
+    fn tree_order(&self, a: NodeId, b: NodeId) -> std::cmp::Ordering {
+        let path = |mut id: NodeId| {
+            let mut path = vec![id];
+            while let Some(parent) = self.nodes.get(id).and_then(|n| n.parent) {
+                path.push(parent);
+                id = parent;
+            }
+            path.reverse();
+            path
+        };
+        let (pa, pb) = (path(a), path(b));
+        if pa[0] != pb[0] {
+            return a.cmp(&b);
+        }
+        let common = pa.iter().zip(&pb).take_while(|(x, y)| x == y).count();
+        match (pa.get(common), pb.get(common)) {
+            (Some(&x), Some(&y)) => {
+                let children = &self.nodes[pa[common - 1]].children;
+                let at = |n: NodeId| children.iter().position(|&c| c == n);
+                at(x).cmp(&at(y))
+            }
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
         }
     }
 

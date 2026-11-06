@@ -1,7 +1,7 @@
 //! acrender: pushing and popping layers. Upstream's `LayerManager` stopped pushing layers past 1024
 //! per painter (silently dropping those clips, and counted differently by a fragment's recording and
 //! a whole-page one) and kept accounting nothing read.
-use acgpu::{Filter, PaintScene};
+use acde_gpu::{Filter, PaintScene};
 use kurbo::{Affine, Shape};
 use peniko::{Fill, Mix};
 use std::sync::Arc;

@@ -21,7 +21,7 @@ use crate::kurbo_css::NonUniformRoundedRectRadii;
 use crate::layers;
 use crate::sizing::compute_object_fit;
 use crate::text::DrawTextContext;
-use acgpu::{PaintScene, Scene};
+use acde_gpu::{PaintScene, Scene};
 use blitz_dom::node::{
     ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextInputData,
     TextLayout, TextNodeData,
@@ -105,7 +105,7 @@ impl<'a> PhysicalTracks<'a> {
 }
 
 /// acrender: `command` with `transform` applied on top of its own
-pub fn placed(command: acgpu::RenderCommand, transform: Affine) -> acgpu::RenderCommand {
+pub fn placed(command: acde_gpu::RenderCommand, transform: Affine) -> acde_gpu::RenderCommand {
     command.transformed(transform)
 }
 
@@ -1745,7 +1745,7 @@ fn create_css_box(
 /// (a cached paint fragment is recorded in local space and placed later): render relative to the
 /// element and append, so it is the same either way.
 fn draw_svg_tree(scene: &mut impl PaintScene, tree: &usvg::Tree, transform: Affine, inner: Affine) {
-    let mut local = acgpu::Scene::new();
+    let mut local = acde_gpu::Scene::new();
     crate::svg::SvgPainter::draw(&mut local, tree, inner);
     scene.append_scene(local, transform);
 }

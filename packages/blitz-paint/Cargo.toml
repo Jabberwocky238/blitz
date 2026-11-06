@@ -1,6 +1,6 @@
 [package]
 name = "blitz-paint"
-description = "Paint a Blitz Document into acgpu's 2D scene"
+description = "Paint a Blitz Document into acde-gpu's 2D scene"
 documentation = "https://docs.rs/blitz-paint"
 version.workspace = true
 license.workspace = true
@@ -24,7 +24,7 @@ scrollbars = ["blitz-dom/scrollbars"]
 
 [dependencies]
 # Blitz dependencies
-acgpu = { workspace = true }
+acde-gpu = { workspace = true }
 blitz-traits = { workspace = true }
 blitz-dom = { workspace = true }
 
