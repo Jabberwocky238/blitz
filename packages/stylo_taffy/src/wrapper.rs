@@ -33,6 +33,38 @@ bitflags! {
         const IS_BUTTON = 1 << 3;
         /// Whether the node is a button-type input whose label always uses block layout
         const IS_BUTTON_INPUT = 1 << 4;
+        /// acrender: whether the node is a fieldset, which establishes a new block formatting
+        /// context (HTML's rendering of fieldset: it behaves as `flow-root`)
+        const IS_FIELDSET = 1 << 5;
+    }
+}
+
+/// acrender: a fieldset with a rendered legend, while the fieldset's own algorithm lays out its
+/// content (HTML, "The fieldset and legend elements"): the block-start border takes the legend's
+/// margin box when that is taller than the border, and definite content-box block sizes give that
+/// extra space back so the border box stays what the style says.
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub struct LegendBand {
+    /// The space allocated for the block-start border
+    pub border: f32,
+    /// How much of it lies beyond the border's own width
+    pub spill: f32,
+}
+
+impl LegendBand {
+    fn shrink_dimension(self, value: taffy::Dimension) -> taffy::Dimension {
+        match value.tag() == taffy::CompactLength::LENGTH_TAG {
+            true => taffy::Dimension::length((value.value() - self.spill).max(0.0)),
+            false => value,
+        }
+    }
+
+    fn shrink_limit(self, value: taffy::LengthPercentageAuto) -> taffy::LengthPercentageAuto {
+        let raw = value.into_raw();
+        match raw.tag() == taffy::CompactLength::LENGTH_TAG {
+            true => taffy::LengthPercentageAuto::length((raw.value() - self.spill).max(0.0)),
+            false => value,
+        }
     }
 }
 
@@ -57,6 +89,9 @@ pub struct TaffyStyloStyle<T: Deref<Target = ComputedValues>> {
     /// `parent_size.width`, i.e. the containing block's block size.
     #[cfg(feature = "writing-mode")]
     pub percent_basis: Option<f32>,
+    /// acrender: set while the node is a fieldset laying out its content around a rendered legend
+    /// (horizontal writing modes only)
+    pub legend_band: Option<LegendBand>,
 }
 
 impl<T: Deref<Target = ComputedValues>> TaffyStyloStyle<T> {
@@ -85,6 +120,7 @@ impl<T: Deref<Target = ComputedValues>> TaffyStyloStyle<T> {
             align_axis_is_inline: false,
             #[cfg(feature = "writing-mode")]
             percent_basis: None,
+            legend_band: None,
         }
     }
 
@@ -101,7 +137,16 @@ impl<T: Deref<Target = ComputedValues>> TaffyStyloStyle<T> {
             align_axis_is_inline: false,
             #[cfg(feature = "writing-mode")]
             percent_basis: None,
+            legend_band: None,
         }
+    }
+
+    /// acrender: the legend band, when definite block sizes are content-box sizes (border-box ones
+    /// already include the border, whatever space it takes)
+    #[inline(always)]
+    fn content_box_band(&self) -> Option<LegendBand> {
+        self.legend_band
+            .filter(|_| self.style.get_position().box_sizing == stylo::BoxSizing::ContentBox)
     }
 
     /// The writing mode the getters are expressed in (the style's own without the feature)
@@ -183,7 +228,10 @@ impl<T: Deref<Target = ComputedValues>> taffy::CoreStyle for TaffyStyloStyle<T> 
     #[inline]
     fn is_block(&self) -> bool {
         // Button inputs always establish an independent formatting context.
-        !self.flags.contains(StyleFlags::IS_BUTTON_INPUT)
+        // acrender: so do fieldsets
+        !self
+            .flags
+            .intersects(StyleFlags::IS_BUTTON_INPUT | StyleFlags::IS_FIELDSET)
             && convert::is_block(self.effective_display())
     }
 
@@ -249,27 +297,39 @@ impl<T: Deref<Target = ComputedValues>> taffy::CoreStyle for TaffyStyloStyle<T> 
     #[inline]
     fn size(&self) -> taffy::Size<taffy::Dimension> {
         let position_styles = self.style.get_position();
+        let mut height = convert::dimension(&position_styles.height);
+        if let Some(band) = self.content_box_band() {
+            height = band.shrink_dimension(height);
+        }
         self.size(taffy::Size {
             width: convert::dimension(&position_styles.width),
-            height: convert::dimension(&position_styles.height),
+            height,
         })
     }
 
     #[inline]
     fn min_size(&self) -> taffy::Size<taffy::LengthPercentageAuto> {
         let position_styles = self.style.get_position();
+        let mut height = convert::min_size(&position_styles.min_height);
+        if let Some(band) = self.content_box_band() {
+            height = band.shrink_limit(height);
+        }
         self.size(taffy::Size {
             width: convert::min_size(&position_styles.min_width),
-            height: convert::min_size(&position_styles.min_height),
+            height,
         })
     }
 
     #[inline]
     fn max_size(&self) -> taffy::Size<taffy::LengthPercentageAuto> {
         let position_styles = self.style.get_position();
+        let mut height = convert::max_size(&position_styles.max_height);
+        if let Some(band) = self.content_box_band() {
+            height = band.shrink_limit(height);
+        }
         self.size(taffy::Size {
             width: convert::max_size(&position_styles.max_width),
-            height: convert::max_size(&position_styles.max_height),
+            height,
         })
     }
 
@@ -327,10 +387,13 @@ impl<T: Deref<Target = ComputedValues>> taffy::CoreStyle for TaffyStyloStyle<T> 
                 &border_styles.border_right_width,
                 border_styles.border_right_style,
             ),
-            top: convert::border(
-                &border_styles.border_top_width,
-                border_styles.border_top_style,
-            ),
+            top: match self.legend_band {
+                Some(band) => taffy::LengthPercentage::length(band.border),
+                None => convert::border(
+                    &border_styles.border_top_width,
+                    border_styles.border_top_style,
+                ),
+            },
             bottom: convert::border(
                 &border_styles.border_bottom_width,
                 border_styles.border_bottom_style,

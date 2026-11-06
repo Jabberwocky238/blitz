@@ -14,8 +14,8 @@
 //! are re-recorded every frame.
 use std::collections::HashMap;
 
-use acgpu::Scene;
 use acgpu::RenderCommand;
+use acgpu::Scene;
 use blitz_dom::node::{NodeData, SpecialElementData};
 use blitz_dom::{BaseDocument, Node, NodeId};
 use kurbo::{Affine, Point, Rect, Vec2};
@@ -205,6 +205,10 @@ impl Builder {
         let own = node.id == self.node;
         self.deps.push(Dep::of(doc, node, own, selection));
         self.visit_table(doc, node);
+        // acrender: a fieldset paints its border around its rendered legend's box
+        if let Some(legend) = doc.rendered_legend(node.id).and_then(|id| doc.get_node(id)) {
+            self.deps.push(Dep::of(doc, legend, false, None));
+        }
     }
 
     /// A table root paints its columns', rows' and their groups' backgrounds behind its cells, at

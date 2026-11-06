@@ -326,8 +326,15 @@ fn classify_flow_children(
             matches!(display.inside(), DisplayInside::Contents)
         });
     let child_ids = node.children.iter().copied().chain(pseudo_ids);
+    // acrender: a fieldset's rendered legend is block-level whatever its display
+    let legend = super::fieldset::legend_candidate(doc, container_node_id);
     for child_id in child_ids {
         let child = &doc.nodes[child_id];
+        if Some(child_id) == legend {
+            classification.all_out_of_flow = false;
+            classification.all_inline = false;
+            continue;
+        }
 
         // Comment nodes generate no boxes and must not affect the
         // inline-vs-block classification: an unstyled comment would
@@ -819,7 +826,13 @@ fn collect_complex_layout_children(
     hide_whitespace: bool,
     needs_wrap: fn(NodeKind, DisplayOutside) -> bool,
 ) {
+    // acrender: a fieldset's rendered legend is block-level whatever its display
+    let legend = super::fieldset::legend_candidate(doc, container_node_id);
     doc.iter_children_and_pseudos_mut(container_node_id, |child_id, doc| {
+        if Some(child_id) == legend {
+            out.push(child_id, doc);
+            return;
+        }
         // Get node kind (text, element, comment, etc)
         let child_node_kind = doc.nodes[child_id].data.kind();
 

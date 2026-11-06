@@ -147,6 +147,18 @@ fn sample_points_along_path(path: &BezPath, spacing: f64, count: usize) -> Vec<P
 impl ElementCx<'_, '_> {
     /// Draw all borders for a node
     pub(crate) fn draw_border(&self, scene: &mut impl PaintScene) {
+        // acrender: a fieldset's border is not painted behind its rendered legend
+        let Some(gap) = self.legend_gap else {
+            return self.draw_border_unclipped(scene);
+        };
+        let mut outside = self.frame.border_box.inflate(1.0, 1.0).to_path(0.1);
+        outside.extend(gap.to_path(0.1));
+        scene.push_clip_layer(Fill::EvenOdd, self.transform, &outside);
+        self.draw_border_unclipped(scene);
+        scene.pop_layer();
+    }
+
+    fn draw_border_unclipped(&self, scene: &mut impl PaintScene) {
         let style = &*self.style;
         let border = style.get_border();
         let current_color = style.clone_color();

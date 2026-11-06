@@ -1159,6 +1159,10 @@ impl Node {
             if el.is_button_input() {
                 flags |= stylo_taffy::StyleFlags::IS_BUTTON_INPUT;
             }
+            // acrender: a fieldset establishes a new block formatting context
+            if el.name.local == local_name!("fieldset") {
+                flags |= stylo_taffy::StyleFlags::IS_FIELDSET;
+            }
             if let Some(inline_layout) = el.inline_layout_data.as_deref() {
                 flags |= inline_layout.span_cb_flags;
             }
@@ -1230,6 +1234,13 @@ impl Node {
                         DisplayInside::None | DisplayInside::Contents
                     )
                 {
+                    taffy::Display::FlowRoot
+                } else if display.inside() == DisplayInside::Flow
+                    && self
+                        .element_data()
+                        .is_some_and(|el| el.name.local == local_name!("fieldset"))
+                {
+                    // acrender: a fieldset behaves as `flow-root` (HTML's rendering of fieldset)
                     taffy::Display::FlowRoot
                 } else {
                     stylo_taffy::convert::display(display)

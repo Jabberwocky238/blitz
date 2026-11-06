@@ -24,6 +24,7 @@ use taffy::{
 
 pub(crate) mod construct;
 pub(crate) mod damage;
+pub(crate) mod fieldset;
 pub(crate) mod inline;
 pub(crate) mod list;
 pub(crate) mod paint_tree;
@@ -100,6 +101,9 @@ pub(crate) struct LayoutPassState<'doc> {
     /// size, against which its percentage padding resolves (see `layout::writing_mode`).
     #[cfg(feature = "writing-mode")]
     pub(crate) orthogonal_percent_basis: Option<(crate::NodeId, f32)>,
+    /// acrender: fieldsets whose content is being laid out around their rendered legend
+    /// (see `layout::fieldset`)
+    pub(crate) fieldsets: Vec<fieldset::FieldsetFrame>,
 }
 
 impl<'doc> LayoutPassState<'doc> {
@@ -137,6 +141,7 @@ impl<'doc> LayoutPassState<'doc> {
             current_align_axis_is_inline: false,
             #[cfg(feature = "writing-mode")]
             orthogonal_percent_basis: None,
+            fieldsets: Vec::new(),
         }
     }
 }
@@ -550,14 +555,37 @@ impl LayoutPassState<'_> {
                     return self.compute_inline_layout(dom_node_id(node_id), inputs, block_ctx);
                 }
 
+                // acrender: a fieldset lays out its content around its rendered legend
+                let display = node.taffy_display();
+                #[cfg(feature = "writing-mode")]
+                let column_flex = node.is_column_flex_container();
+                if let Some(legend) = self.rendered_legend(dom_node_id(node_id)) {
+                    let algorithm: fn(
+                        &mut Self,
+                        NodeId,
+                        taffy::LayoutInput,
+                    ) -> taffy::LayoutOutput = match display {
+                        Display::Flex => {
+                            #[cfg(feature = "writing-mode")]
+                            {
+                                self.current_align_axis_is_inline = column_flex;
+                            }
+                            |tree, id, inputs| compute_flexbox_layout(tree, id, inputs)
+                        }
+                        Display::Grid => |tree, id, inputs| compute_grid_layout(tree, id, inputs),
+                        _ => |tree, id, inputs| compute_block_layout(tree, id, inputs, None),
+                    };
+                    return self.compute_fieldset_layout(node_id, legend, inputs, algorithm);
+                }
+
                 // The default CSS file will set
-                match node.taffy_display() {
+                match display {
                     Display::Block => compute_block_layout(self, node_id, inputs, block_ctx),
                     Display::FlowRoot => compute_block_layout(self, node_id, inputs, None),
                     Display::Flex => {
                         #[cfg(feature = "writing-mode")]
                         {
-                            self.current_align_axis_is_inline = node.is_column_flex_container();
+                            self.current_align_axis_is_inline = column_flex;
                         }
                         compute_flexbox_layout(self, node_id, inputs)
                     }
@@ -580,28 +608,41 @@ impl TraversePartialTree for LayoutPassState<'_> {
 
     fn child_ids(&self, node_id: NodeId) -> Self::ChildIter<'_> {
         let layout_children = self.node_from_id(node_id).layout_children.borrow(); //.unwrap().as_ref();
-        RefCellChildIter::new(Ref::map(layout_children, |children| {
+        let mut iter = RefCellChildIter::new(Ref::map(layout_children, |children| {
             children.as_ref().map(|c| c.as_slice()).unwrap_or(&[])
-        }))
+        }));
+        // acrender: the rendered legend is not one of the fieldset's content's children
+        iter.skip = self
+            .fieldset_frame(dom_node_id(node_id))
+            .map(|frame| frame.legend);
+        iter
     }
 
     fn child_count(&self, node_id: NodeId) -> usize {
-        self.node_from_id(node_id)
+        let count = self
+            .node_from_id(node_id)
             .layout_children
             .borrow()
             .as_ref()
             .map(|c| c.len())
-            .unwrap_or(0)
+            .unwrap_or(0);
+        count - usize::from(self.fieldset_frame(dom_node_id(node_id)).is_some())
     }
 
     fn get_child_id(&self, node_id: NodeId, index: usize) -> NodeId {
-        taffy_node_id(
-            self.node_from_id(node_id)
-                .layout_children
-                .borrow()
-                .as_ref()
-                .unwrap()[index],
-        )
+        let children = self.node_from_id(node_id).layout_children.borrow();
+        let children = children.as_ref().unwrap();
+        match self.fieldset_frame(dom_node_id(node_id)) {
+            Some(frame) => taffy_node_id(
+                children
+                    .iter()
+                    .copied()
+                    .filter(|&id| id != frame.legend)
+                    .nth(index)
+                    .unwrap(),
+            ),
+            None => taffy_node_id(children[index]),
+        }
     }
 }
 impl TraverseTree for LayoutPassState<'_> {}
@@ -622,11 +663,16 @@ impl LayoutPartialTree for LayoutPassState<'_> {
             let dom_id = dom_node_id(node_id);
             let mut style = self.nodes[dom_id].layout_style_in(self.layout_wm_of(dom_id));
             style.set_percent_basis(self.orthogonal_percent_basis_of(dom_id));
+            style.legend_band = self.fieldset_frame(dom_id).map(|frame| frame.band);
             style
         }
         #[cfg(not(feature = "writing-mode"))]
         {
-            self.node_from_id(node_id).layout_style()
+            let mut style = self.node_from_id(node_id).layout_style();
+            style.legend_band = self
+                .fieldset_frame(dom_node_id(node_id))
+                .map(|frame| frame.band);
+            style
         }
     }
 
@@ -849,19 +895,28 @@ impl RoundTree for LayoutPassState<'_> {
 pub struct RefCellChildIter<'a> {
     items: Ref<'a, [crate::NodeId]>,
     idx: usize,
+    /// acrender: a child left out (a fieldset's rendered legend)
+    skip: Option<crate::NodeId>,
 }
 impl<'a> RefCellChildIter<'a> {
     fn new(items: Ref<'a, [crate::NodeId]>) -> RefCellChildIter<'a> {
-        RefCellChildIter { items, idx: 0 }
+        RefCellChildIter {
+            items,
+            idx: 0,
+            skip: None,
+        }
     }
 }
 
 impl Iterator for RefCellChildIter<'_> {
     type Item = NodeId;
     fn next(&mut self) -> Option<Self::Item> {
-        self.items.get(self.idx).map(|id| {
+        loop {
+            let id = *self.items.get(self.idx)?;
             self.idx += 1;
-            taffy_node_id(*id)
-        })
+            if Some(id) != self.skip {
+                return Some(taffy_node_id(id));
+            }
+        }
     }
 }

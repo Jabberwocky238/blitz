@@ -749,10 +749,8 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 // - y0: negative top expansion
                 // - x1: positive right expansion
                 // - y1: positive bottom expansion
-                let filter_expansion_area = filter
-                    .as_ref()
-                    .map(|f| f.expansion())
-                    .unwrap_or(Rect::ZERO);
+                let filter_expansion_area =
+                    filter.as_ref().map(|f| f.expansion()).unwrap_or(Rect::ZERO);
 
                 // acrender: the border box (the bounding box of its path)
                 let mut effect_layer_clip = cx.frame.border_box;
@@ -907,13 +905,19 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // todo: maybe cache this so we don't need to constantly be figuring it out
         // It is quite a bit of math to calculate during render/traverse
         // Also! we can cache the bezpaths themselves, saving us a bunch of work
-        let frame = create_css_rect(&style, &layout, scale);
+        // acrender: a fieldset with a rendered legend paints its box from the border through the
+        // legend's middle, with a gap in the border behind the legend
+        let (frame, legend_gap) = match self.dom.rendered_legend(node.id) {
+            Some(legend) => fieldset_frame(&style, &layout, self.dom.get_node(legend), scale),
+            None => (create_css_rect(&style, &layout, scale), None),
+        };
 
         let element = node.element_data().unwrap();
 
         ElementCx {
             context: self,
             frame,
+            legend_gap,
             scale,
             style,
             node,
@@ -971,6 +975,8 @@ fn to_peniko_image(image: &RasterImageData, quality: peniko::ImageQuality) -> pe
 struct ElementCx<'dom, 'a> {
     context: &'dom BlitzDomPainter<'dom, 'a>,
     frame: CssBox,
+    /// acrender: a fieldset's border is not painted behind its rendered legend (this rectangle)
+    legend_gap: Option<Rect>,
     style: style::servo_arc::Arc<ComputedValues>,
     scale: f64,
     node: &'dom Node,
@@ -1654,13 +1660,62 @@ fn insets_from_taffy_rect(input: taffy::Rect<f64>) -> Insets {
 
 /// Convert Stylo and Taffy types into Kurbo types
 fn create_css_rect(style: &ComputedValues, layout: &Layout, scale: f64) -> CssBox {
+    let size = layout.size.map(|v| v as f64);
+    let border_box = Rect::new(0.0, 0.0, size.width, size.height);
+    create_css_box(style, border_box, layout.border, layout.padding, scale)
+}
+
+/// acrender: the box a fieldset with a rendered legend paints, and the gap in its border
+/// (HTML's rendering of fieldset): the legend is centred on the block-start border (laid out by
+/// blitz-dom's `layout::fieldset`, which gives the border the legend's margin box when it is taller),
+/// so the border box starts at the border's top edge there; the content box stays where layout put it.
+fn fieldset_frame(
+    style: &ComputedValues,
+    layout: &Layout,
+    legend: Option<&Node>,
+    scale: f64,
+) -> (CssBox, Option<Rect>) {
+    let Some(legend) = legend else {
+        return (create_css_rect(style, layout, scale), None);
+    };
+    let l = legend.final_layout();
+    let border = layout.border.top as f64;
+    let margin_box = (l.margin.top + l.size.height + l.margin.bottom) as f64;
+    let band = border.max(margin_box);
+    let centre = match margin_box >= border {
+        true => l.margin.top as f64 + l.size.height as f64 / 2.0,
+        false => border / 2.0,
+    };
+    let top = (centre - border / 2.0).max(0.0);
+    let size = layout.size.map(|v| v as f64);
+    let border_box = Rect::new(0.0, top, size.width, size.height.max(top));
+    let mut padding = layout.padding;
+    padding.top = ((band + layout.padding.top as f64 - top - border).max(0.0)) as f32;
+    let frame = create_css_box(style, border_box, layout.border, padding, scale);
+    let (x, y) = (l.location.x as f64, l.location.y as f64);
+    let gap = Rect::new(
+        x,
+        (y - l.margin.top as f64).min(top),
+        x + l.size.width as f64,
+        (y + l.size.height as f64 + l.margin.bottom as f64).max(top + border),
+    );
+    (frame, Some(gap.scale_from_origin(scale)))
+}
+
+fn create_css_box(
+    style: &ComputedValues,
+    border_box: Rect,
+    border: taffy::Rect<f32>,
+    padding: taffy::Rect<f32>,
+    scale: f64,
+) -> CssBox {
     // Resolve and rescale
     // We have to scale since document pixels are not same same as rendered pixels
-    let width: f64 = layout.size.width as f64;
-    let height: f64 = layout.size.height as f64;
-    let border_box = Rect::new(0.0, 0.0, width * scale, height * scale);
-    let border = insets_from_taffy_rect(layout.border.map(|p| p as f64 * scale));
-    let padding = insets_from_taffy_rect(layout.padding.map(|p| p as f64 * scale));
+    let width: f64 = border_box.width();
+    let height: f64 = border_box.height();
+    let border_box = border_box.scale_from_origin(scale);
+    let border = insets_from_taffy_rect(border.map(|p| p as f64 * scale));
+    let padding = insets_from_taffy_rect(padding.map(|p| p as f64 * scale));
     let outline_width = style.get_outline().outline_width.0.to_f64_px() * scale;
 
     // Resolve the radii to a length. need to downscale since the radii are in document pixels

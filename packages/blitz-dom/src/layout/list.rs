@@ -94,6 +94,10 @@ fn node_list_item_child(
             if let Some(font_family) = font_for_bullet_style(list_style_type) {
                 parley_style.font_family = font_family;
             }
+            // acrender: `::marker` is `white-space: pre` (UA stylesheet), so the suffix's space ("1. ") is
+            // kept at the end of the marker and separates it from the item's text
+            parley_style.white_space_collapse = parley::WhiteSpaceCollapse::Preserve;
+            parley_style.text_wrap_mode = parley::TextWrapMode::NoWrap;
 
             // Create a parley tree builder
             let mut font_ctx = doc.font_ctx.lock().unwrap();
@@ -113,8 +117,7 @@ fn node_list_item_child(
             };
 
             let mut layout = builder.build().0;
-            let width = layout.calculate_content_widths().max;
-            layout.break_all_lines(Some(width));
+            layout.break_all_lines(None);
 
             ListItemLayoutPosition::Outside(Box::new(layout))
         }
