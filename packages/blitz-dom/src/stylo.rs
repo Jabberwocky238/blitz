@@ -952,6 +952,37 @@ impl<'a> TElement for BlitzNode<'a> {
 
         let tag = &elem.name.local;
 
+        // acrender: SVG presentation attributes are author-level hints below every style rule
+        // (https://svgwg.org/svg2-draft/styling.html#PresentationAttributes), parsed as CSS so
+        // `stroke="var(--x)"` resolves and getComputedStyle sees them; url() references are left
+        // to the serializer, which passes the attribute through to usvg unchanged
+        if elem.name.ns == ns!(svg) {
+            static BLANK: std::sync::LazyLock<style::stylesheets::UrlExtraData> = std::sync::LazyLock::new(|| {
+                style::stylesheets::UrlExtraData(Arc::new(url::Url::parse("about:blank").unwrap()))
+            });
+            let css: String = elem
+                .attrs()
+                .iter()
+                .filter(|attr| attr.name.ns == ns!() && SVG_PRESENTATION.contains(&&*attr.name.local))
+                .filter(|attr| !attr.value.contains("url("))
+                .map(|attr| format!("{}:{};", &*attr.name.local, attr.value.replace(';', "")))
+                .collect();
+            if !css.is_empty() {
+                let block = style::properties::declaration_block::parse_style_attribute(
+                    &css,
+                    &BLANK,
+                    None,
+                    QuirksMode::NoQuirks,
+                    style::stylesheets::CssRuleType::Style,
+                );
+                hints.push(ApplicableDeclarationBlock::from_declarations(
+                    Arc::new(self.guard().wrap(block)),
+                    CascadeLevel::new(CascadeOrigin::PresHints),
+                    LayerOrder::root(),
+                ));
+            }
+        }
+
         let mut push_style = |decl: PropertyDeclaration| {
             hints.push(ApplicableDeclarationBlock::from_declarations(
                 Arc::new(
@@ -1618,3 +1649,25 @@ fn parse_inline() {
 
     // let val = CSSInlineStyleDeclaration();
 }
+
+// acrender: the SVG presentation attributes mapped to CSS (the ones the serializer writes back)
+const SVG_PRESENTATION: &[&str] = &[
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "stroke",
+    "stroke-width",
+    "stroke-opacity",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-miterlimit",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "opacity",
+    "visibility",
+    "color",
+    "font-family",
+    "font-size",
+    "font-weight",
+    "font-style",
+];
