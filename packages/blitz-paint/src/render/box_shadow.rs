@@ -1,7 +1,7 @@
 use super::ElementCx;
 use crate::color::{Color, ToColorColor as _};
 use acde_gpu::PaintScene;
-use kurbo::{Rect, Vec2};
+use kurbo::{Rect, RoundedRect, Shape as _, Vec2};
 use peniko::{Compose, Fill, Mix};
 
 impl ElementCx<'_, '_> {
@@ -130,6 +130,44 @@ impl ElementCx<'_, '_> {
                 y: shadow.base.vertical.px() as f64 * self.scale,
             });
 
+            // The unshadowed area is the padding box shrunk by the spread radius
+            let spread = shadow.spread.px() as f64 * self.scale;
+            let hole = self.frame.padding_box.inflate(-spread, -spread);
+            let blur = shadow.base.blur.px() as f64 * self.scale;
+
+            // acrender: a sharp shadow is one fill of the padding box minus the hole (reversed, so
+            // coincident edges cancel exactly); filling the box and then cutting the hole out left a
+            // faint line wherever both edges fall inside a pixel (xterm.js's bar cursor)
+            if blur == 0.0 {
+                let offset = Vec2 {
+                    x: shadow.base.horizontal.px() as f64 * self.scale,
+                    y: shadow.base.vertical.px() as f64 * self.scale,
+                };
+                let hole = (hole + offset).intersect(self.frame.padding_box);
+                let mut shape = padding_box.clone();
+                if hole.width() > 0.0 && hole.height() > 0.0 {
+                    let hole = RoundedRect::from_rect(hole, radius).to_path(0.1);
+                    shape.extend(hole.reverse_subpaths());
+                }
+                let rounded = radius > 0.0;
+                if rounded {
+                    scene.push_layer(
+                        Fill::NonZero,
+                        Mix::Normal,
+                        1.0,
+                        self.transform,
+                        &padding_box,
+                        None,
+                        None,
+                    );
+                }
+                scene.fill(Fill::NonZero, self.transform, shadow_color, None, &shape);
+                if rounded {
+                    scene.pop_layer();
+                }
+                continue;
+            }
+
             scene.push_layer(
                 Fill::NonZero,
                 Mix::Normal,
@@ -156,16 +194,7 @@ impl ElementCx<'_, '_> {
                 None,
                 None,
             );
-            // The unshadowed area is the padding box shrunk by the spread radius
-            let spread = shadow.spread.px() as f64 * self.scale;
-            let hole = self.frame.padding_box.inflate(-spread, -spread);
-            scene.draw_box_shadow(
-                transform,
-                hole,
-                Color::WHITE,
-                radius,
-                shadow.base.blur.px() as f64 * self.scale,
-            );
+            scene.draw_box_shadow(transform, hole, Color::WHITE, radius, blur);
 
             scene.pop_layer();
             scene.pop_layer();

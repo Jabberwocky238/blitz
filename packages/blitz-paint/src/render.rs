@@ -1131,7 +1131,7 @@ impl ElementCx<'_, '_> {
         let marker = text_layout.ellipsis.as_ref()?;
         let clips = !matches!(self.style.get_box().overflow_x, Overflow::Visible);
         Some(crate::text::Ellipsis {
-            end: (self.frame.content_box.width() * self.scale) as f32,
+            end: self.frame.content_box.width() as f32,
             marker,
             overflow: clips
                 && self.style.get_text().text_overflow.second == TextOverflowSide::Ellipsis,
