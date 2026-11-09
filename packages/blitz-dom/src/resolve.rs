@@ -119,6 +119,8 @@ impl BaseDocument {
             }
         }
         if laid_out {
+            // acrender: a box whose content shrank keeps no scroll offset beyond its new end
+            self.clamp_scroll_offsets();
             self.nodes.bump_geometry_generation();
         }
 

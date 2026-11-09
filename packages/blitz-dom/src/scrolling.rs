@@ -322,6 +322,11 @@ impl BaseDocument {
                 if offset == initial {
                     return false;
                 }
+                // acrender: remembered for clamp_scroll_offsets
+                match offset == Point::ZERO {
+                    true => self.scrolled_nodes.remove(&node_id),
+                    false => self.scrolled_nodes.insert(node_id),
+                };
 
                 let layout = *node.final_layout();
                 self.nodes.bump_geometry_generation();
@@ -339,6 +344,37 @@ impl BaseDocument {
                 self.shell_provider.request_redraw();
                 true
             }
+        }
+    }
+
+    /// acrender: keep scroll positions inside the scrolling area after layout changed it (CSSOM View:
+    /// a scrolling box's position is clamped when its scrolling area shrinks). Without this a box whose
+    /// content got shorter stays scrolled past its end, showing nothing at the top, and is no longer
+    /// scrollable to get back. The embedder sees the new offsets like any other scroll.
+    pub(crate) fn clamp_scroll_offsets(&mut self) {
+        let clamp = |current: Point<f64>, max: Point<f64>| Point {
+            x: current.x.clamp(0.0, max.x),
+            y: current.y.clamp(0.0, max.y),
+        };
+        let nodes: Vec<NodeId> = self.scrolled_nodes.iter().copied().collect();
+        for node_id in nodes {
+            if self.nodes.get(node_id).is_none() {
+                self.scrolled_nodes.remove(&node_id);
+                continue;
+            }
+            let (current, max) = self.scroll_state(ScrollTarget::Node(node_id), true);
+            let clamped = clamp(current, max);
+            if clamped != current {
+                *self.nodes[node_id].scroll_offset_mut() = clamped;
+                if clamped == Point::ZERO {
+                    self.scrolled_nodes.remove(&node_id);
+                }
+            }
+        }
+        let (current, max) = self.scroll_state(ScrollTarget::Viewport, true);
+        let clamped = clamp(current, max);
+        if clamped != current {
+            self.set_viewport_scroll(clamped);
         }
     }
 

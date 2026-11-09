@@ -312,6 +312,8 @@ pub struct BaseDocument {
     /// When each scroll container's overlay scrollbars were last shown
     /// (scrolled, or the pointer left the thumb); drives their fade-out
     pub(crate) scrollbar_activity: HashMap<NodeId, Instant>,
+    /// acrender: the nodes with a scroll offset other than zero, clamped after layout
+    pub(crate) scrolled_nodes: HashSet<NodeId>,
     /// Whether and what kind of scroll animation is currently in progress
     pub(crate) scroll_animation: ScrollAnimationState,
 
@@ -544,6 +546,7 @@ impl BaseDocument {
             abort_signal: config.abort_signal,
             hovered_scrollbar: None,
             scrollbar_activity: HashMap::new(),
+            scrolled_nodes: HashSet::new(),
             scroll_animation: ScrollAnimationState::None,
             text_selection: TextSelection::default(),
         };
@@ -1025,6 +1028,7 @@ impl BaseDocument {
             self.hovered_scrollbar = None;
         }
         self.scrollbar_activity.remove(&node_id);
+        self.scrolled_nodes.remove(&node_id);
     }
 
     pub(crate) fn drop_node_ignoring_parent(&mut self, node_id: NodeId) -> Option<Node> {
@@ -1907,6 +1911,16 @@ impl BaseDocument {
             self.snapshot_node_state_only(node_id);
         }
         cb(&mut self.nodes[node_id]);
+    }
+
+    /// acrender: rebuild a `<select>`'s rows (layout::select) after a change its style does not
+    /// show, like an option's selectedness
+    pub fn rebuild_select(&mut self, node_id: NodeId) {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        node.insert_damage(crate::layout::damage::CONSTRUCT_BOX);
+        node.mark_ancestors_dirty();
     }
 
     // Takes (x, y) co-ordinates (relative to the )

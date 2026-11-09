@@ -31,7 +31,7 @@ use super::svg::SvgImageData;
 use super::{Attribute, Attributes};
 use crate::Document;
 use crate::layout::table::TableContext;
-use crate::node::{TextBrush, TextInputData, TextLayout};
+use crate::node::{SelectData, TextBrush, TextInputData, TextLayout};
 
 macro_rules! local_names {
     ($($name:tt),+) => {
@@ -371,6 +371,8 @@ pub enum SpecialElementData {
     TextInput(TextInputData),
     /// Checkbox checked state
     CheckboxInput(bool),
+    /// acrender: a \<select\>'s rows (see `node::select`)
+    Select(Box<SelectData>),
     /// Selected files
     #[cfg(feature = "file-input")]
     FileInput(FileData),
@@ -388,6 +390,7 @@ impl Clone for SpecialElementData {
             Self::TableRoot(data) => Self::TableRoot(data.clone()),
             Self::TextInput(data) => Self::TextInput(data.clone()),
             Self::CheckboxInput(data) => Self::CheckboxInput(*data),
+            Self::Select(data) => Self::Select(data.clone()),
             #[cfg(feature = "file-input")]
             Self::FileInput(data) => Self::FileInput(data.clone()),
             Self::None => Self::None,
@@ -610,6 +613,14 @@ impl ElementData {
     /// Set the checked state of a checkbox/radio input, keeping the
     /// `ElementState::CHECKED` bit (used for `:checked` selector matching and
     /// invalidation) in sync with the special data.
+    /// acrender: a \<select\>'s rows
+    pub fn select_data(&self) -> Option<&SelectData> {
+        match &self.special_data {
+            SpecialElementData::Select(data) => Some(data),
+            _ => None,
+        }
+    }
+
     pub fn set_checkbox_input_checked(&mut self, checked: bool) {
         if let Some(is_checked) = self.checkbox_input_checked_mut() {
             *is_checked = checked;
@@ -885,6 +896,7 @@ impl std::fmt::Debug for SpecialElementData {
             SpecialElementData::TableRoot(_) => f.write_str("NodeSpecificData::TableRoot"),
             SpecialElementData::TextInput(_) => f.write_str("NodeSpecificData::TextInput"),
             SpecialElementData::CheckboxInput(_) => f.write_str("NodeSpecificData::CheckboxInput"),
+            SpecialElementData::Select(_) => f.write_str("NodeSpecificData::Select"),
             #[cfg(feature = "file-input")]
             SpecialElementData::FileInput(_) => f.write_str("NodeSpecificData::FileInput"),
             SpecialElementData::None => f.write_str("NodeSpecificData::None"),

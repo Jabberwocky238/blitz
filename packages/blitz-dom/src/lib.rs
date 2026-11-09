@@ -79,6 +79,7 @@ pub mod util;
 
 pub use crate::layout::paint_tree::{HoistedPaintChild, StackingContext, hoisted_child_position};
 pub use crate::layout::replaced::IntrinsicSizes;
+pub use crate::layout::select::{parse_non_negative_integer, select_mode}; // acrender
 pub use crate::layout::text_transform::{full_size_kana, full_width};
 
 pub use blitz_traits::node_id::NodeId;

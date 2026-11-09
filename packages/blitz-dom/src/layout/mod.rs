@@ -29,6 +29,7 @@ pub(crate) mod inline;
 pub(crate) mod list;
 pub(crate) mod paint_tree;
 pub(crate) mod replaced;
+pub mod select; // acrender
 pub(crate) mod table;
 pub(crate) mod text_transform;
 #[cfg(feature = "writing-mode")]
@@ -329,6 +330,32 @@ impl LayoutPassState<'_> {
                                 placeholder.refresh_layout(font_ctx, &mut doc.layout_ctx);
                             }
                         }
+                    }
+                    return output;
+                }
+
+                // acrender: a select is a leaf sized by its rows (layout::select); a list box scrolls
+                // through all of them
+                if let Some(select) = element_data.select_data() {
+                    let (width, height) = select.content_size();
+                    let rows = select
+                        .list_box
+                        .then_some(select.row_height * select.items.len() as f32);
+                    let style = node.layout_style();
+                    let mut output = compute_leaf_layout(
+                        inputs,
+                        &style,
+                        resolve_calc_value,
+                        |_known_size, _available_space| taffy::Size { width, height },
+                    );
+                    if let Some(rows) = rows {
+                        let padding = style
+                            .padding()
+                            .resolve_or_zero(inputs.parent_size.width, resolve_calc_value);
+                        output.scrollable_overflow_rect.bottom = output
+                            .scrollable_overflow_rect
+                            .bottom
+                            .max(padding.top + rows + padding.bottom);
                     }
                     return output;
                 }

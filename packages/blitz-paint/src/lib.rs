@@ -127,6 +127,12 @@ fn paint_viewport(
     (painter.pieces.take(), painter.pinned_pieces.take())
 }
 
+/// acrender: an open drop-down box's list of options (see [`blitz_dom::node::SelectPicker`]), to draw
+/// on top of the page
+pub fn paint_select_picker(scene: &mut Scene, doc: &BaseDocument, picker: &blitz_dom::node::SelectPicker, scale: f64) {
+    render::form_controls::draw_picker(scene, doc, picker, scale);
+}
+
 /// acrender: paints one element and its subtree (e.g. for a drag image), see
 /// [`BlitzDomPainter::paint_element`].
 pub fn paint_element(

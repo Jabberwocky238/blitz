@@ -4,6 +4,7 @@ mod attributes;
 mod element;
 mod inline_edge; // acrender
 mod node;
+mod select; // acrender
 pub(crate) mod scrollbar;
 mod serialize;
 #[cfg(feature = "svg")]
@@ -22,6 +23,7 @@ pub use element::{
 };
 pub use inline_edge::InlineEdge;
 pub use node::*;
+pub use select::{SelectData, SelectItem, SelectItemKind, SelectPicker};
 pub use scrollbar::{ScrollbarColor, ScrollbarRef, ScrollbarWidth};
 #[cfg(feature = "svg")]
 pub use simple_svg::{Rgba, SimpleOp, SimpleSvg};

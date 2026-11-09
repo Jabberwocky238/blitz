@@ -435,6 +435,11 @@ fn collect_layout_children_with_wrap(
     if let Some(el) = doc.nodes[container_node_id].data.downcast_element() {
         // Handle text inputs
         let tag_name = el.name.local.as_ref();
+        // acrender: a select draws its own rows (layout::select), its children are not boxes
+        if tag_name == "select" && el.name.ns == ns!(html) {
+            super::select::create_select(doc, container_node_id);
+            return;
+        }
         if matches!(tag_name, "input" | "textarea") {
             let type_attr: Option<&str> = doc.nodes[container_node_id]
                 .data

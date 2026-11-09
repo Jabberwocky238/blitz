@@ -105,6 +105,16 @@ impl BaseDocument {
         damage_from_children.remove(REORDER_CHILDREN);
         damage |= damage_from_children;
 
+        // acrender: a select's rows are built from its options (layout::select): a change below it
+        // (an option's text, label or state) rebuilds its box
+        if !damage_from_children.is_empty()
+            && self.nodes[node_id]
+                .data
+                .is_element_with_tag_name(&markup5ever::local_name!("select"))
+        {
+            damage.insert(CONSTRUCT_BOX);
+        }
+
         // Put children back
         self.nodes[node_id].children = children;
 
