@@ -229,6 +229,7 @@ impl LayoutPassState<'_> {
         block_ctx: Option<&mut BlockContext<'_>>,
     ) -> taffy::tree::LayoutOutput {
         let orthogonal_percent_basis = self.orthogonal_percent_basis_of(dom_node_id(node_id));
+        let video_size = self.video_sizes.get(&dom_node_id(node_id)).copied(); // acrender
         let node = &mut self.nodes[dom_node_id(node_id)];
 
         let font_styles = node.primary_styles().map(|style| {
@@ -465,7 +466,14 @@ impl LayoutPassState<'_> {
                             ImageData::None => (IntrinsicSizes::default(), taffy::Size::ZERO),
                         },
                         SpecialElementData::SubDocument(_) | SpecialElementData::None => {
-                            tag_intrinsic_sizes(&element_data.name.local, attr_size)
+                            // acrender: a <video> with a frame is as big as its frames
+                            match video_size {
+                                Some((width, height)) if element_data.name.local == local_name!("video") && width > 0.0 && height > 0.0 => (
+                                    IntrinsicSizes { width: Some(width), height: Some(height), ratio: Some(width / height) },
+                                    DEFAULT_OBJECT_SIZE,
+                                ),
+                                _ => tag_intrinsic_sizes(&element_data.name.local, attr_size),
+                            }
                         }
                         _ => unreachable!(),
                     };

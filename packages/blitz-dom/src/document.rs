@@ -341,6 +341,8 @@ pub struct BaseDocument {
     /// acrender: what each `<canvas>` has drawn (2D context commands, in its bitmap's pixels), painted
     /// into its content box
     pub(crate) canvas_pictures: HashMap<NodeId, Arc<acde_gpu::Scene>>,
+    /// acrender: each `<video>`'s intrinsic size (its current frame's), laid out like an image's
+    pub(crate) video_sizes: HashMap<NodeId, (f32, f32)>,
     /// acrender: simple inline SVGs built straight from the DOM (see DocumentConfig::svg_text_only)
     pub(crate) svg_from_dom: bool,
     /// acrender: `DocumentConfig::skip_iframe_content`
@@ -521,6 +523,7 @@ impl BaseDocument {
             subdoc_is_animating: false,
             sub_document_nodes: HashSet::new(),
             canvas_pictures: HashMap::new(),
+            video_sizes: HashMap::new(),
             svg_from_dom: !config.svg_text_only,
             skip_iframe_content: config.skip_iframe_content,
             iframe_loads: HashMap::new(),
@@ -867,6 +870,7 @@ impl BaseDocument {
     pub(crate) fn remove_node_from_tree(&mut self, node_id: NodeId) -> Option<Node> {
         self.clear_interaction_state_for_removed_node(node_id);
         self.canvas_pictures.remove(&node_id);
+        self.video_sizes.remove(&node_id);
         let node = self.nodes.remove(node_id)?;
         self.forget_layout_child(&node, node_id);
         Some(node)
@@ -1239,6 +1243,25 @@ impl BaseDocument {
 
     pub fn canvas_picture(&self, node_id: NodeId) -> Option<&Arc<acde_gpu::Scene>> {
         self.canvas_pictures.get(&node_id)
+    }
+
+    /// acrender: a `<video>`'s intrinsic size (`None`: no frame yet, the 300x150 default object size); a change lays it out again
+    pub fn set_video_size(&mut self, node_id: NodeId, size: Option<(f32, f32)>) {
+        if self.video_sizes.get(&node_id).copied() == size {
+            return;
+        }
+        match size {
+            Some(size) => _ = self.video_sizes.insert(node_id, size),
+            None => _ = self.video_sizes.remove(&node_id),
+        }
+        if let Some(node) = self.get_node_mut(node_id) {
+            node.clear_layout_cache();
+            node.insert_damage(crate::layout::damage::ALL_DAMAGE);
+        }
+    }
+
+    pub fn video_size(&self, node_id: NodeId) -> Option<(f32, f32)> {
+        self.video_sizes.get(&node_id).copied()
     }
 
     /// acrender: one line of text for a 2D canvas (`fillText` / `measureText`), with the document's fonts.

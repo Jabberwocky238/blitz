@@ -1562,7 +1562,8 @@ impl ElementCx<'_, '_> {
     /// acrender: a 2D canvas: its picture (in bitmap pixels, `width` x `height` attributes) fitted into the
     /// content box like an image, in a layer of its own (clearRect / destination-* only touch the canvas)
     fn draw_canvas_picture(&self, scene: &mut impl PaintScene) {
-        if self.node.local_name() != "canvas" {
+        let video = self.node.local_name() == "video";
+        if self.node.local_name() != "canvas" && !video {
             return;
         }
         let Some(picture) = self.context.dom.canvas_picture(self.node.id) else {
@@ -1574,9 +1575,14 @@ impl ElementCx<'_, '_> {
                 .and_then(|v| v.trim().parse::<u32>().ok())
                 .map_or(default, |v| v as f32)
         };
-        let object_size = taffy::Size {
-            width: attr(local_name!("width"), 300.0),
-            height: attr(local_name!("height"), 150.0),
+        // acrender: a <video>'s picture is its current frame, in the frame's pixels
+        let object_size = match self.context.dom.video_size(self.node.id) {
+            Some((width, height)) if video => taffy::Size { width, height },
+            _ if video => return,
+            _ => taffy::Size {
+                width: attr(local_name!("width"), 300.0),
+                height: attr(local_name!("height"), 150.0),
+            },
         };
         if object_size.width <= 0.0 || object_size.height <= 0.0 {
             return;
