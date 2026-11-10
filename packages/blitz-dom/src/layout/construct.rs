@@ -432,6 +432,17 @@ fn collect_layout_children_with_wrap(
 
     flush_pseudo_elements(doc, container_node_id);
 
+    let checkbox = doc.nodes[container_node_id].data.downcast_element().is_some_and(|el| {
+        el.name.local == local_name!("input") && matches!(el.attr(local_name!("type")), Some("checkbox" | "radio"))
+    });
+    if checkbox {
+        create_checkbox_input(doc, container_node_id);
+        // acrender: with `appearance: none` it is an ordinary box, its ::before / ::after are laid out
+        if doc.nodes[container_node_id].has_native_appearance() {
+            return;
+        }
+    }
+
     if let Some(el) = doc.nodes[container_node_id].data.downcast_element() {
         // Handle text inputs
         let tag_name = el.name.local.as_ref();
@@ -454,12 +465,6 @@ fn collect_layout_children_with_wrap(
             ) {
                 create_text_editor(doc, container_node_id, false);
                 return;
-            } else if matches!(type_attr, Some("checkbox" | "radio")) {
-                create_checkbox_input(doc, container_node_id);
-                // acrender: with `appearance: none` it is an ordinary box, its ::before / ::after are laid out
-                if doc.nodes[container_node_id].has_native_appearance() {
-                    return;
-                }
             }
         }
 
