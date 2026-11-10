@@ -138,6 +138,15 @@ pub struct ResourceLoadResponse {
     pub result: Result<Resource, String>,
 }
 
+impl crate::BaseDocument {
+    /// acrender: whether the image of `node_id` is still being fetched (its response not yet handled)
+    pub fn is_image_pending(&self, node_id: NodeId) -> bool {
+        self.pending_images
+            .values()
+            .any(|nodes| nodes.iter().any(|(id, _)| *id == node_id))
+    }
+}
+
 pub struct StylesheetHandler {
     pub source_url: Url,
     pub guard: SharedRwLock,
@@ -147,6 +156,10 @@ pub struct StylesheetHandler {
 }
 
 impl NetHandler for ResourceHandler<StylesheetHandler> {
+    fn destination(&self) -> &'static str {
+        "style"
+    }
+
     fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
         let Ok(css) = std::str::from_utf8(&bytes) else {
             return self.respond(resolved_url, Err(String::from("Invalid UTF8")));
@@ -266,6 +279,10 @@ struct NestedStylesheetHandler {
 }
 
 impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
+    fn destination(&self) -> &'static str {
+        "style"
+    }
+
     fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
         let Ok(css) = std::str::from_utf8(&bytes) else {
             return self.respond(resolved_url, Err(String::from("Invalid UTF8")));
@@ -312,6 +329,10 @@ struct FontFaceHandler {
     font_sources: FontSources,
 }
 impl NetHandler for ResourceHandler<FontFaceHandler> {
+    fn destination(&self) -> &'static str {
+        "font"
+    }
+
     fn bytes(mut self: Box<Self>, resolved_url: String, bytes: Bytes) {
         let result = self.data.parse(bytes);
         if let Ok(Resource::Font(..)) = result {
@@ -583,6 +604,10 @@ fn stylo_to_fontique_style(style: &FontStyleRange) -> parley::fontique::FontStyl
 pub(crate) struct DocumentSrcHandler;
 
 impl NetHandler for ResourceHandler<DocumentSrcHandler> {
+    fn destination(&self) -> &'static str {
+        "iframe"
+    }
+
     fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
         let html = String::from_utf8_lossy(&bytes).into_owned();
         self.respond(resolved_url, Ok(Resource::DocumentSrc(html)));
@@ -599,6 +624,10 @@ impl ImageHandler {
 }
 
 impl NetHandler for ResourceHandler<ImageHandler> {
+    fn destination(&self) -> &'static str {
+        "image"
+    }
+
     fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
         let result = self.data.parse(bytes);
         self.respond(resolved_url, result)

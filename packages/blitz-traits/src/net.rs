@@ -33,6 +33,12 @@ pub trait NetProvider: Send + Sync + 'static {
 /// the NetCallack with the result.
 pub trait NetHandler: Send + Sync + 'static {
     fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes);
+
+    /// acrender: the request's destination as Fetch names it ("image", "style", "font",
+    /// "iframe"; "" when unknown), so a provider can apply that destination's rules
+    fn destination(&self) -> &'static str {
+        ""
+    }
 }
 
 /// A callback which gets called every time a network request completes
