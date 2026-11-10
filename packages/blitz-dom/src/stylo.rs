@@ -298,10 +298,13 @@ impl crate::document::BaseDocument {
             thread_local: &mut thread_local,
         };
         let styles = resolve_style(&mut context, node, RuleInclusion::All, None, None);
+        let primary = styles.primary().clone();
+        drop(context);
+        drop(thread_local);
 
         style::thread_state::exit(ThreadState::LAYOUT);
 
-        Some(styles.primary().clone())
+        Some(primary)
     }
 }
 
