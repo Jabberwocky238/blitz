@@ -1137,6 +1137,14 @@ impl Node {
             .and_then(|stylo| stylo.primary_styles())
     }
 
+    /// acrender: a form control is drawn as a native widget unless its `appearance` is `none`
+    /// (https://drafts.csswg.org/css-ui-4/#appearance-switching); then it is an ordinary box
+    pub fn has_native_appearance(&self) -> bool {
+        self.primary_styles().is_none_or(|style| {
+            style.get_box().appearance != style::values::computed::Appearance::None
+        })
+    }
+
     /// A lazy Taffy style backed by this node's primary stylo style.
     ///
     /// Panics if the node has no computed styles: layout always runs after

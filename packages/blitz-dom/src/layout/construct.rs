@@ -456,7 +456,10 @@ fn collect_layout_children_with_wrap(
                 return;
             } else if matches!(type_attr, Some("checkbox" | "radio")) {
                 create_checkbox_input(doc, container_node_id);
-                return;
+                // acrender: with `appearance: none` it is an ordinary box, its ::before / ::after are laid out
+                if doc.nodes[container_node_id].has_native_appearance() {
+                    return;
+                }
             }
         }
 

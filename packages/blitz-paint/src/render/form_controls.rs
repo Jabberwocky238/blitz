@@ -1,10 +1,11 @@
 use super::ElementCx;
-use crate::color::{Color, ToColorColor as _};
+use crate::color::{Color, ToColorColor as _, contrast_ratio};
 use acde_gpu::PaintScene;
 use blitz_dom::local_name;
 use kurbo::{Affine, BezPath, Cap, Circle, Join, Point, RoundedRect, Stroke, Vec2};
 use peniko::Fill;
 use style::dom::TElement as _;
+use style::values::generics::color::GenericColorOrAuto;
 
 impl ElementCx<'_, '_> {
     pub(super) fn draw_input(&self, scene: &mut impl PaintScene) {
@@ -14,15 +15,35 @@ impl ElementCx<'_, '_> {
         let Some(checked) = self.element.checkbox_input_checked() else {
             return;
         };
+        // acrender: `appearance: none` draws no widget, the element's own boxes show
+        if !self.node.has_native_appearance() {
+            return;
+        }
 
         let type_attr = self.node.attr(local_name!("type"));
         let disabled = self.node.attr(local_name!("disabled")).is_some();
 
-        // TODO this should be coming from css accent-color, but I couldn't find how to retrieve it
+        // acrender: a checked control takes `accent-color` (https://drafts.csswg.org/css-ui-4/#widget-accent);
+        // `auto` keeps the text colour
+        let current_color = self.style.clone_color();
         let accent_color = if disabled {
             Color::from_rgba8(209, 209, 209, 255)
         } else {
-            self.style.clone_color().as_srgb_color()
+            match self.style.clone_accent_color() {
+                GenericColorOrAuto::Color(color) => color.resolve_to_absolute(&current_color),
+                GenericColorOrAuto::Auto => current_color,
+            }
+            .as_srgb_color()
+        };
+        let border_color = if disabled {
+            accent_color
+        } else {
+            current_color.as_srgb_color()
+        };
+        let mark_color = if contrast_ratio(accent_color, Color::WHITE) < 3.0 {
+            Color::from_rgb8(26, 26, 26)
+        } else {
+            Color::WHITE
         };
 
         let width = self.frame.border_box.width();
@@ -34,7 +55,8 @@ impl ElementCx<'_, '_> {
 
         match type_attr {
             Some("checkbox") => {
-                draw_checkbox(scene, checked, frame, self.transform, accent_color, scale);
+                let colors = [accent_color, mark_color, border_color];
+                draw_checkbox(scene, checked, frame, self.transform, colors, scale);
             }
             Some("radio") => {
                 let center = frame.center();
@@ -50,7 +72,7 @@ fn draw_checkbox(
     checked: bool,
     frame: RoundedRect,
     transform: Affine,
-    accent_color: Color,
+    [accent_color, mark_color, border_color]: [Color; 3],
     scale: f64,
 ) {
     if checked {
@@ -73,10 +95,10 @@ fn draw_checkbox(
             dash_offset: 0.0,
         };
 
-        scene.stroke(&style, transform, Color::WHITE, None, &path);
+        scene.stroke(&style, transform, mark_color, None, &path);
     } else {
         scene.fill(Fill::NonZero, transform, Color::WHITE, None, &frame);
-        scene.stroke(&Stroke::default(), transform, accent_color, None, &frame);
+        scene.stroke(&Stroke::default(), transform, border_color, None, &frame);
     }
 }
 

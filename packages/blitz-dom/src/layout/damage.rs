@@ -439,6 +439,8 @@ pub(crate) fn compute_layout_damage(old: &ComputedValues, new: &ComputedValues) 
             || old_box.position != new_box.position
             || old_box.contain != new_box.contain
             || old.clone_visibility() != new.clone_visibility()
+            // acrender: `appearance: none` makes a widget an ordinary box
+            || old_box.appearance != new_box.appearance
         {
             return true;
         }

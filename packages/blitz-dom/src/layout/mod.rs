@@ -231,6 +231,7 @@ impl LayoutPassState<'_> {
         let orthogonal_percent_basis = self.orthogonal_percent_basis_of(dom_node_id(node_id));
         let video_size = self.video_sizes.get(&dom_node_id(node_id)).copied(); // acrender
         let node = &mut self.nodes[dom_node_id(node_id)];
+        let native_appearance = node.has_native_appearance(); // acrender
 
         let font_styles = node.primary_styles().map(|style| {
             use style::values::computed::font::LineHeight;
@@ -367,7 +368,7 @@ impl LayoutPassState<'_> {
                         Some("hidden") => {
                             return taffy::LayoutOutput::HIDDEN;
                         }
-                        Some("checkbox") => {
+                        Some("checkbox") if native_appearance => {
                             return compute_leaf_layout(
                                 inputs,
                                 &node.layout_style(),

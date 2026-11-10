@@ -65,17 +65,26 @@ input[type="hidden" i] {
     display: none !important;
 }
 
+/* acrender: native widgets until the page sets `appearance: none` (https://drafts.csswg.org/css-ui-4/#appearance-switching);
+   like Chrome they take no input border, padding or background, so a page's own box starts clean (the widgets keep
+   their former 20px / 18px border boxes) */
 input[type="checkbox"] {
-    width: 14px;
-    height: 14px;
+    appearance: auto;
+    width: 20px;
+    height: 20px;
+    padding: initial;
+    border: initial;
+    background-color: initial;
     margin: 3px 3px 3px 4px;
 }
 
 input[type="radio"] {
-    width: 14px;
-    height: 14px;
-    border-radius: 14px;
-    border: none;
+    appearance: auto;
+    width: 18px;
+    height: 18px;
+    padding: initial;
+    border: initial;
+    background-color: initial;
     margin: 3px 3px 3px 4px;
 }
 
