@@ -26,7 +26,8 @@ pub(crate) fn convert_single_filter(filter: &StyloFilter) -> Option<FilterEffect
         StyloFilter::DropShadow(shadow) => DropShadow {
             dx: shadow.horizontal.px(),
             dy: shadow.vertical.px(),
-            std_deviation: shadow.blur.px(),
+            // acrender: drop-shadow() is feDropShadow with stdDeviation = radius / 2 (Filter Effects 1), as for box-shadow
+            std_deviation: shadow.blur.px() / 2.0,
             // TODO: pass in correct currentColor
             color: shadow
                 .color
