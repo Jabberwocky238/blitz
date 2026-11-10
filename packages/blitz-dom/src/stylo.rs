@@ -292,15 +292,15 @@ impl crate::document::BaseDocument {
             snapshot_map: &self.snapshots,
             registered_speculative_painters: &RegisteredPaintersImpl,
         };
-        let mut thread_local = ThreadLocalStyleContext::new();
-        let mut context = StyleContext {
-            shared: &shared,
-            thread_local: &mut thread_local,
+        // the style context and its thread-local end before leaving LAYOUT
+        let primary = {
+            let mut thread_local = ThreadLocalStyleContext::new();
+            let mut context = StyleContext {
+                shared: &shared,
+                thread_local: &mut thread_local,
+            };
+            resolve_style(&mut context, node, RuleInclusion::All, None, None).primary().clone()
         };
-        let styles = resolve_style(&mut context, node, RuleInclusion::All, None, None);
-        let primary = styles.primary().clone();
-        drop(context);
-        drop(thread_local);
 
         style::thread_state::exit(ThreadState::LAYOUT);
 
