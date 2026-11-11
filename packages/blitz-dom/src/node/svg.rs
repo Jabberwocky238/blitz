@@ -336,3 +336,91 @@ fn view_box_transform(
     let ty = (height - view_box.height() * sy) * align_y - view_box.y() * sy;
     usvg::Transform::from_row(sx, 0.0, 0.0, sy, tx, ty)
 }
+
+const XLINK: &str = "http://www.w3.org/1999/xlink";
+
+fn parse_xml(text: &str) -> Option<roxmltree::Document<'_>> {
+    let options = roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() };
+    roxmltree::Document::parse_with_options(text, options).ok()
+}
+
+/// acrender: the `href`s of `<use>` elements that point into another file (`icons.svg#github`)
+pub(crate) fn external_uses(source: &str) -> Vec<String> {
+    let Some(doc) = parse_xml(source) else {
+        return Vec::new();
+    };
+    let mut hrefs: Vec<String> = Vec::new();
+    for node in doc.descendants().filter(|n| n.has_tag_name("use")) {
+        let Some(href) = node.attribute("href").or_else(|| node.attribute((XLINK, "href"))) else {
+            continue;
+        };
+        let external = href.split_once('#').is_some_and(|(path, id)| !path.is_empty() && !id.is_empty());
+        if external && !hrefs.iter().any(|known| known == href) {
+            hrefs.push(href.to_owned());
+        }
+    }
+    hrefs
+}
+
+/// acrender: usvg resolves `<use>` only inside the same document; copy each element an external `<use>`
+/// points at (from `sprite(path)`, the loaded file) into a `<defs>` of `source` under a local id
+pub(crate) fn inline_external_uses(source: &str, sprite: impl Fn(&str) -> Option<Arc<str>>) -> String {
+    let mut out = source.to_owned();
+    let mut defs = String::new();
+    for (n, href) in external_uses(source).iter().enumerate() {
+        let Some((path, id)) = href.split_once('#') else {
+            continue;
+        };
+        let Some(text) = sprite(path) else {
+            continue;
+        };
+        let Some(external) = parse_xml(&text) else {
+            continue;
+        };
+        let Some(target) = external.descendants().find(|node| node.attribute("id") == Some(id)) else {
+            continue;
+        };
+        let local = format!("acde-sprite-{n}-{id}");
+        let piece = &text[target.range()];
+        let renamed = piece
+            .replacen(&format!("id=\"{id}\""), &format!("id=\"{local}\""), 1)
+            .replacen(&format!("id='{id}'"), &format!("id=\"{local}\""), 1);
+        defs.push_str(&renamed);
+        let quoted = format!("\"{}\"", href.replace('&', "&amp;"));
+        out = out.replace(&quoted, &format!("\"#{local}\""));
+    }
+    if let (false, Some(end)) = (defs.is_empty(), out.rfind("</svg>")) {
+        out.insert_str(end, &format!("<defs>{defs}</defs>"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod sprite_tests {
+    use super::*;
+
+    const PAGE: &str = concat!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">"#,
+        r##"<use href="/icons.svg#github"></use><use xlink:href="#local"></use></svg>"##
+    );
+    const SPRITE: &str = concat!(
+        r#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg">"#,
+        r#"<symbol id="github" viewBox="0 0 16 16"><path d="M0 0h16v16z"/></symbol><symbol id="x"/></svg>"#
+    );
+
+    #[test]
+    fn only_uses_into_other_files_are_external() {
+        assert_eq!(external_uses(PAGE), ["/icons.svg#github"]);
+        assert!(external_uses("<svg xmlns=\"http://www.w3.org/2000/svg\"/>").is_empty());
+    }
+
+    #[test]
+    fn the_target_is_copied_in_under_a_local_id() {
+        let inlined = inline_external_uses(PAGE, |path| (path == "/icons.svg").then(|| Arc::from(SPRITE)));
+        assert!(inlined.contains(r##"<use href="#acde-sprite-0-github">"##), "{inlined}");
+        assert!(inlined.contains(r#"<defs><symbol id="acde-sprite-0-github" viewBox="0 0 16 16"><path d="M0 0h16v16z"/></symbol></defs></svg>"#), "{inlined}");
+        assert!(!inlined.contains("symbol id=\"x\""));
+        assert!(usvg::Tree::from_str(&inlined, &usvg::Options::default()).is_ok());
+        assert_eq!(inline_external_uses(PAGE, |_| None), PAGE);
+    }
+}

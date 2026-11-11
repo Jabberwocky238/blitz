@@ -30,4 +30,6 @@ pub use simple_svg::{Rgba, SimpleOp, SimpleSvg};
 pub use stylo_data::ComputedStyleRef;
 #[cfg(feature = "svg")]
 pub use svg::{SvgImageData, SvgIntrinsicDimensions};
+#[cfg(feature = "svg")]
+pub(crate) use svg::{external_uses, inline_external_uses};
 pub use text::{TextBrush, TextInputData, TextLayout};

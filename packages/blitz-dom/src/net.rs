@@ -70,6 +70,9 @@ pub enum Resource {
     Font(Bytes, FontFaceOverrides),
     /// HTML fetched for an `<iframe>` element's `src`
     DocumentSrc(String),
+    /// acrender: an SVG file an inline `<use>` points into (the requested URL, the text)
+    #[cfg(feature = "svg")]
+    SvgSprite(String, String),
     None,
 }
 
@@ -611,6 +614,23 @@ impl NetHandler for ResourceHandler<DocumentSrcHandler> {
     fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
         let html = String::from_utf8_lossy(&bytes).into_owned();
         self.respond(resolved_url, Ok(Resource::DocumentSrc(html)));
+    }
+}
+
+/// acrender: an SVG file that inline `<use>` elements point into
+#[cfg(feature = "svg")]
+pub(crate) struct SvgSpriteHandler(pub(crate) String);
+
+#[cfg(feature = "svg")]
+impl NetHandler for ResourceHandler<SvgSpriteHandler> {
+    fn destination(&self) -> &'static str {
+        "image"
+    }
+
+    fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let url = self.data.0.clone();
+        self.respond(resolved_url, Ok(Resource::SvgSprite(url, text)));
     }
 }
 

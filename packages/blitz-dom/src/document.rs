@@ -345,6 +345,12 @@ pub struct BaseDocument {
     pub(crate) video_sizes: HashMap<NodeId, (f32, f32)>,
     /// acrender: simple inline SVGs built straight from the DOM (see DocumentConfig::svg_text_only)
     pub(crate) svg_from_dom: bool,
+    /// acrender: SVG files inline `<use>` elements point into, by URL (`None` while loading or after a failure),
+    /// and the inline `<svg>` roots waiting for each
+    #[cfg(feature = "svg")]
+    pub(crate) svg_sprites: HashMap<String, Option<Arc<str>>>,
+    #[cfg(feature = "svg")]
+    pub(crate) svg_sprite_waiters: HashMap<String, Vec<NodeId>>,
     /// acrender: `DocumentConfig::skip_iframe_content`
     pub(crate) skip_iframe_content: bool,
     /// Load state (abort controller and in-flight request id) for each
@@ -525,6 +531,10 @@ impl BaseDocument {
             canvas_pictures: HashMap::new(),
             video_sizes: HashMap::new(),
             svg_from_dom: !config.svg_text_only,
+            #[cfg(feature = "svg")]
+            svg_sprites: HashMap::new(),
+            #[cfg(feature = "svg")]
+            svg_sprite_waiters: HashMap::new(),
             skip_iframe_content: config.skip_iframe_content,
             iframe_loads: HashMap::new(),
 
@@ -1735,10 +1745,61 @@ impl BaseDocument {
                 // TODO: see if we can only invalidate if resolved fonts may have changed
                 self.invalidate_inline_contexts();
             }
+            #[cfg(feature = "svg")]
+            Resource::SvgSprite(url, text) => {
+                self.svg_sprites.insert(url.clone(), Some(Arc::from(text)));
+                for node_id in self.svg_sprite_waiters.remove(&url).unwrap_or_default() {
+                    if let Some(node) = self.nodes.get_mut(node_id) {
+                        node.insert_damage(crate::layout::damage::CONSTRUCT_BOX);
+                        node.mark_ancestors_dirty();
+                    }
+                }
+            }
             Resource::None => {
                 // Do nothing
             }
         }
+    }
+
+    /// acrender: `source` (an inline `<svg>` written out) with the elements its external `<use>`s point at
+    /// copied in; files not loaded yet are fetched, and `node_id` is built again when they arrive
+    #[cfg(feature = "svg")]
+    pub(crate) fn svg_with_sprites(&mut self, node_id: NodeId, source: String) -> String {
+        let hrefs = crate::node::external_uses(&source);
+        if hrefs.is_empty() {
+            return source;
+        }
+        let mut urls: HashMap<String, String> = HashMap::new();
+        for href in &hrefs {
+            let path = href.split_once('#').map_or(href.as_str(), |(path, _)| path);
+            let Some(mut url) = self.url.resolve_relative(path) else {
+                continue;
+            };
+            url.set_fragment(None);
+            urls.insert(path.to_owned(), url.to_string());
+        }
+        for url in urls.values() {
+            match self.svg_sprites.get(url) {
+                Some(Some(_)) => continue,
+                Some(None) => {
+                    if let Some(waiting) = self.svg_sprite_waiters.get_mut(url) {
+                        waiting.push(node_id);
+                    }
+                    continue;
+                }
+                None => {}
+            }
+            let Ok(parsed) = url::Url::parse(url) else {
+                continue;
+            };
+            self.svg_sprites.insert(url.clone(), None);
+            self.svg_sprite_waiters.insert(url.clone(), vec![node_id]);
+            let handler = crate::net::SvgSpriteHandler(url.clone());
+            let boxed = crate::net::ResourceHandler::boxed(self.tx.clone(), self.id, Some(node_id), self.shell_provider.clone(), handler);
+            self.net_provider.fetch(self.id(), self.build_request(parsed), boxed);
+        }
+        let sprites = &self.svg_sprites;
+        crate::node::inline_external_uses(&source, |path| urls.get(path).and_then(|url| sprites.get(url).cloned().flatten()))
     }
 
     /// Cache a loaded image and apply it to all nodes waiting on it

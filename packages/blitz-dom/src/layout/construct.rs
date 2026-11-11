@@ -489,7 +489,11 @@ fn collect_layout_children_with_wrap(
                     }
                     Ok(svg)
                 }
-                None => crate::util::parse_svg_image(node.svg_source().as_bytes(), fonts),
+                None => {
+                    let source = node.svg_source();
+                    let source = doc.svg_with_sprites(container_node_id, source);
+                    crate::util::parse_svg_image(source.as_bytes(), fonts)
+                }
             };
 
             // Remove contruction damage from subtree
