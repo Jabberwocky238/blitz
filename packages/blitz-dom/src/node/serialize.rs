@@ -293,18 +293,44 @@ impl Node {
         {
             return None;
         }
+        // acrender: a CSS transform (a class, an animation) wins over the `transform` attribute, as in
+        // browsers; usvg only reads the attribute, so the computed one is written in its place. The root's
+        // transform is its box's and is painted with the box
+        let css_transform = (!root)
+            .then(|| {
+                let (w, h) = viewport;
+                let reference_box = euclid::Rect::new(
+                    euclid::Point2D::new(
+                        style::values::computed::CSSPixelLength::new(0.0),
+                        style::values::computed::CSSPixelLength::new(0.0),
+                    ),
+                    euclid::Size2D::new(
+                        style::values::computed::CSSPixelLength::new(w),
+                        style::values::computed::CSSPixelLength::new(h),
+                    ),
+                );
+                crate::resolve_2d_transform(style.get_box(), reference_box)
+            })
+            .flatten();
         let mut attrs = Vec::new();
-        for attr in e
-            .attrs()
-            .iter()
-            .filter(|a| &*a.name.local != "style" && &*a.name.local != "xmlns")
-        {
+        for attr in e.attrs().iter().filter(|a| {
+            &*a.name.local != "style"
+                && &*a.name.local != "xmlns"
+                && !(css_transform.is_some() && &*a.name.local == "transform")
+        }) {
             let mut name = String::new();
             write_attr_name(&attr.name, &mut name);
             attrs.push((name, resolve(&attr.value)));
         }
         for (name, value) in &geometry {
             attrs.push(((*name).to_owned(), format!("{value}")));
+        }
+        if let Some(t) = css_transform {
+            let [a, b, c, d, e, f] = t.as_coeffs();
+            attrs.push((
+                "transform".to_owned(),
+                format!("matrix({a} {b} {c} {d} {e} {f})"),
+            ));
         }
         let has_attr = |name: &str| e.attrs().iter().any(|a| &*a.name.local == name);
         let mut css = Vec::new();
