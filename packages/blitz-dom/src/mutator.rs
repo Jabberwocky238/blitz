@@ -4,7 +4,7 @@ use std::mem;
 use std::ops::{Deref, DerefMut};
 
 use crate::layout::damage::ALL_DAMAGE;
-use crate::net::{ImageHandler, ResourceHandler, StylesheetHandler};
+use crate::net::{ImageHandler, ResourceHandler};
 use crate::node::{NodeFlags, SpecialElementData};
 use crate::stylo_device::DeviceChanges;
 use crate::util::ImageType;
@@ -14,7 +14,6 @@ use crate::{
 use blitz_traits::shell::Viewport;
 use style::Atom;
 use style::invalidation::element::restyle_hints::RestyleHint;
-use style::stylesheets::OriginSet;
 use style_dom::ElementState;
 use thin_vec::ThinVec;
 
@@ -467,8 +466,15 @@ impl DocumentMutator<'_> {
             self.load_image(node_id);
         } else if (tag, attr) == tag_and_attr!("link", "href")
             || (tag, attr) == tag_and_attr!("link", "rel")
+            || (tag, attr) == tag_and_attr!("link", "crossorigin")
         {
+            // acrender: crossorigin too, the sheet is fetched again under the new CORS settings
             self.load_linked_stylesheet(node_id);
+        } else if (tag, attr) == tag_and_attr!("link", "media")
+            || (tag, attr) == tag_and_attr!("style", "media")
+        {
+            // acrender
+            self.doc.update_stylesheet_media(node_id);
         } else if (tag, attr) == tag_and_attr!("iframe", "src")
             || (tag, attr) == tag_and_attr!("iframe", "srcdoc")
         {
@@ -578,8 +584,20 @@ impl DocumentMutator<'_> {
             node.set_restyle_hint(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
         } else if (tag, attr) == tag_and_attr!("input", "checked") {
             element.set_checkbox_input_checked(false);
-        } else if (tag, attr) == tag_and_attr!("link", "href") {
+        } else if (tag, attr) == tag_and_attr!("link", "href")
+            || (tag, attr) == tag_and_attr!("link", "rel")
+        {
+            // acrender: rel too; nothing to unload is not a panic any more
             self.unload_stylesheet(node_id);
+        } else if (tag, attr) == tag_and_attr!("link", "crossorigin") {
+            // acrender: fetched again, as a request that is not a CORS one
+            self.load_linked_stylesheet(node_id);
+        } else if ((tag, attr) == tag_and_attr!("link", "media")
+            || (tag, attr) == tag_and_attr!("style", "media"))
+            && node_is_in_document
+        {
+            // acrender
+            self.doc.update_stylesheet_media(node_id);
         } else if (tag, attr) == tag_and_attr!("iframe", "srcdoc") && node_is_in_document {
             // Fall back to loading from the `src` attribute (if any)
             self.load_iframe(node_id);
@@ -1129,6 +1147,15 @@ impl<'doc> DocumentMutator<'doc> {
                 return;
             };
 
+            // acrender: a <link> whose sheet is still being fetched has none to unload, but its
+            // fetch must be forgotten
+            if element.name.local == local_name!("link")
+                && !matches!(element.special_data, SpecialElementData::Stylesheet(_))
+            {
+                self.eager_op_queue
+                    .push(SpecialOp::UnloadStylesheet(node_id));
+            }
+
             match &element.special_data {
                 SpecialElementData::SubDocument(_) => {
                     self.eager_op_queue
@@ -1141,6 +1168,7 @@ impl<'doc> DocumentMutator<'doc> {
                 SpecialElementData::TableRoot(_) => {}
                 SpecialElementData::TextInput(_) => {}
                 SpecialElementData::CheckboxInput(_) => {}
+                SpecialElementData::RangeInput(_) => {}
                 SpecialElementData::Select(_) => {}
                 #[cfg(feature = "file-input")]
                 SpecialElementData::FileInput(_) => {}
@@ -1173,74 +1201,13 @@ impl<'doc> DocumentMutator<'doc> {
         }
     }
 
+    // acrender: both moved to BaseDocument (fetch_linked_stylesheet, unload_linked_stylesheet)
     fn load_linked_stylesheet(&mut self, target_id: NodeId) {
-        let node = &self.doc.nodes[target_id];
-
-        let mut is_in_head = false;
-        let mut parent_id = node.parent;
-        while let Some(id) = parent_id
-            && !is_in_head
-        {
-            let parent = &self.doc.nodes[id];
-            is_in_head |= parent.data.is_element_with_tag_name(&local_name!("head"));
-            parent_id = parent.parent;
-        }
-
-        let rel_attr = node.attr(local_name!("rel"));
-        let href_attr = node.attr(local_name!("href"));
-
-        let (Some(rels), Some(href)) = (rel_attr, href_attr) else {
-            return;
-        };
-        if !rels.split_ascii_whitespace().any(|rel| rel == "stylesheet") {
-            return;
-        }
-
-        let url = self.doc.resolve_url(href);
-        let handler = ResourceHandler::new(
-            self.doc.tx.clone(),
-            self.doc.id(),
-            Some(node.id),
-            self.doc.shell_provider.clone(),
-            StylesheetHandler {
-                source_url: url.clone(),
-                guard: self.doc.guard.clone(),
-                net_provider: self.doc.net_provider.clone(),
-                abort_signal: self.doc.abort_signal.clone(),
-                font_sources: self.doc.font_sources.clone(),
-            },
-        );
-
-        if is_in_head && !self.doc.net_provider.is_noop() {
-            self.doc
-                .pending_critical_resources
-                .insert(handler.request_id());
-        }
-
-        self.doc.net_provider.fetch(
-            self.doc.id(),
-            self.doc.build_request(url),
-            Box::new(handler),
-        );
+        self.doc.fetch_linked_stylesheet(target_id);
     }
 
     fn unload_stylesheet(&mut self, node_id: NodeId) {
-        let node = &mut self.doc.nodes[node_id];
-        let Some(element) = node.element_data_mut() else {
-            unreachable!();
-        };
-        let SpecialElementData::Stylesheet(stylesheet) = element.special_data.take() else {
-            unreachable!();
-        };
-
-        let guard = self.doc.guard.read();
-        self.doc.stylist.remove_stylesheet(stylesheet, &guard);
-        self.doc
-            .stylist
-            .force_stylesheet_origins_dirty(OriginSet::all());
-
-        self.doc.nodes_to_stylesheet.remove(&node_id);
-        self.doc.stylesheet_generation += 1;
+        self.doc.unload_linked_stylesheet(node_id);
     }
 
     fn load_image(&mut self, target_id: NodeId) {

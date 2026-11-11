@@ -8,37 +8,45 @@ use style::dom::TElement as _;
 use style::values::generics::color::GenericColorOrAuto;
 
 impl ElementCx<'_, '_> {
+    // acrender: checkboxes, radio buttons and range inputs take `accent-color`
+    // (https://drafts.csswg.org/css-ui-4/#widget-accent); `auto` keeps the text colour
+    fn accent_color(&self, disabled: bool) -> Color {
+        if disabled {
+            return Color::from_rgba8(209, 209, 209, 255);
+        }
+        let current_color = self.style.clone_color();
+        match self.style.clone_accent_color() {
+            GenericColorOrAuto::Color(color) => color.resolve_to_absolute(&current_color),
+            GenericColorOrAuto::Auto => current_color,
+        }
+        .as_srgb_color()
+    }
+
     pub(super) fn draw_input(&self, scene: &mut impl PaintScene) {
         if self.node.local_name() != "input" {
+            return;
+        }
+        // acrender: `appearance: none` draws no widget, the element's own boxes show
+        if !self.node.has_native_appearance() {
+            return;
+        }
+        let disabled = self.node.attr(local_name!("disabled")).is_some();
+        let accent_color = self.accent_color(disabled);
+        // acrender: a range input is a track, its filled part and a thumb
+        if let Some(fraction) = self.element.range_input_fraction() {
+            let content = self.frame.content_box;
+            draw_range(scene, fraction, content, self.transform, accent_color, self.scale);
             return;
         }
         let Some(checked) = self.element.checkbox_input_checked() else {
             return;
         };
-        // acrender: `appearance: none` draws no widget, the element's own boxes show
-        if !self.node.has_native_appearance() {
-            return;
-        }
 
         let type_attr = self.node.attr(local_name!("type"));
-        let disabled = self.node.attr(local_name!("disabled")).is_some();
-
-        // acrender: a checked control takes `accent-color` (https://drafts.csswg.org/css-ui-4/#widget-accent);
-        // `auto` keeps the text colour
-        let current_color = self.style.clone_color();
-        let accent_color = if disabled {
-            Color::from_rgba8(209, 209, 209, 255)
-        } else {
-            match self.style.clone_accent_color() {
-                GenericColorOrAuto::Color(color) => color.resolve_to_absolute(&current_color),
-                GenericColorOrAuto::Auto => current_color,
-            }
-            .as_srgb_color()
-        };
         let border_color = if disabled {
             accent_color
         } else {
-            current_color.as_srgb_color()
+            self.style.clone_color().as_srgb_color()
         };
         let mark_color = if contrast_ratio(accent_color, Color::WHITE) < 3.0 {
             Color::from_rgb8(26, 26, 26)
@@ -65,6 +73,25 @@ impl ElementCx<'_, '_> {
             _ => {}
         }
     }
+}
+
+fn draw_range(scene: &mut impl PaintScene, fraction: f64, content: kurbo::Rect, transform: Affine, accent: Color, scale: f64) {
+    let radius = (8.0 * scale).min(content.height() / 2.0).max(1.0);
+    let track = (4.0 * scale).min(content.height()).max(1.0);
+    let cy = content.center().y;
+    let left = content.x0 + radius;
+    let right = (content.x1 - radius).max(left);
+    let x = left + (right - left) * fraction.clamp(0.0, 1.0);
+    let rail = RoundedRect::new(content.x0, cy - track / 2.0, content.x1, cy + track / 2.0, track / 2.0);
+    scene.fill(Fill::NonZero, transform, Color::from_rgba8(128, 128, 128, 90), None, &rail);
+    if x > content.x0 {
+        let filled = RoundedRect::new(content.x0, cy - track / 2.0, x, cy + track / 2.0, track / 2.0);
+        scene.fill(Fill::NonZero, transform, accent, None, &filled);
+    }
+    let thumb = Circle::new(Point::new(x, cy), radius);
+    scene.fill(Fill::NonZero, transform, accent, None, &thumb);
+    let inner = Circle::new(Point::new(x, cy), (radius - 2.0 * scale).max(0.0));
+    scene.fill(Fill::NonZero, transform, Color::from_rgba8(255, 255, 255, 255), None, &inner);
 }
 
 fn draw_checkbox(

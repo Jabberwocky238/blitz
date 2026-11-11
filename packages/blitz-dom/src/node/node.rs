@@ -57,6 +57,8 @@ bitflags! {
         const IS_TABLE_ROOT = 0b00000010;
         /// Whether the node is "in the document" (~= has a parent and isn't a template node)
         const IS_IN_DOCUMENT = 0b00000100;
+        /// Whether the node's node document is an XML document (not an HTML document)
+        const IN_XML_DOCUMENT = 0b00001000;
     }
 }
 
@@ -74,6 +76,11 @@ impl NodeFlags {
     #[inline(always)]
     pub fn is_in_document(&self) -> bool {
         self.contains(Self::IS_IN_DOCUMENT)
+    }
+
+    #[inline(always)]
+    pub fn in_xml_document(&self) -> bool {
+        self.contains(Self::IN_XML_DOCUMENT)
     }
 
     #[inline(always)]

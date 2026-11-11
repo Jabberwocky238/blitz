@@ -502,7 +502,7 @@ impl selectors::Element for BlitzNode<'_> {
     }
 
     fn is_html_element_in_html_document(&self) -> bool {
-        true // self.has_namespace(ns!(html))
+        self.has_namespace(&ns!(html)) && !self.flags.in_xml_document()
     }
 
     fn has_local_name(&self, local_name: &LocalName) -> bool {

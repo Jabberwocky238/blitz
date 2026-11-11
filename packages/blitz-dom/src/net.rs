@@ -31,6 +31,28 @@ use crate::{document::DocumentEvent, util::ImageType};
 /// keeps every font registered.
 pub(crate) type FontSources = Arc<std::sync::Mutex<std::collections::HashSet<u64>>>;
 
+/// acrender: one fetch of a `<link>`'s stylesheet, with the sheets it `@import`s (its critical
+/// subresources): `pending` counts the responses the document has not handled yet, so the link's
+/// `load` / `error` waits for all of them, and a response of an earlier fetch (the href changed,
+/// the link left the document) is told apart by `request`. `opaque` is NetHandler::opaque for
+/// the link's own sheet
+#[derive(Debug)]
+pub struct SheetLoad {
+    pub(crate) node: NodeId,
+    pub(crate) request: usize,
+    pub(crate) pending: AtomicUsize,
+    pub(crate) failed: std::sync::atomic::AtomicBool,
+    pub(crate) opaque: std::sync::atomic::AtomicBool,
+}
+
+/// acrender: what `BaseDocument::stylesheet_load` reports for a `<link>`
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SheetLoadState {
+    Loading,
+    Loaded,
+    Failed,
+}
+
 pub(crate) fn stamped_request(url: Url, signal: Option<&AbortSignal>) -> Request {
     let mut req = Request::get(url);
     if let Some(sig) = signal {
@@ -82,7 +104,7 @@ pub(crate) struct ResourceHandler<T: Send + Sync + 'static> {
     node_id: Option<NodeId>,
     tx: Sender<DocumentEvent>,
     shell_provider: Arc<dyn ShellProvider>,
-    data: T,
+    pub(crate) data: T,
 }
 
 impl<T: Send + Sync + 'static> ResourceHandler<T> {
@@ -131,6 +153,16 @@ impl<T: Send + Sync + 'static> ResourceHandler<T> {
         let _ = self.tx.send(DocumentEvent::ResourceLoad(response));
         self.shell_provider.request_redraw();
     }
+
+    /// acrender: after `respond`, one response of `load` is done (see SheetLoad)
+    fn settle(&self, load: &Option<Arc<SheetLoad>>, failed: bool) {
+        if let Some(load) = load {
+            let _ = self.tx.send(DocumentEvent::SheetResponse {
+                load: load.clone(),
+                failed,
+            });
+        }
+    }
 }
 
 #[allow(unused)]
@@ -156,6 +188,12 @@ pub struct StylesheetHandler {
     pub net_provider: Arc<dyn NetProvider>,
     pub abort_signal: Option<AbortSignal>,
     pub(crate) font_sources: FontSources,
+    /// acrender: the link's `media` attribute
+    pub(crate) media: MediaList,
+    /// acrender: the link's `crossorigin` attribute (see NetHandler::cors)
+    pub(crate) cors: &'static str,
+    /// acrender: see SheetLoad
+    pub(crate) load: Option<Arc<SheetLoad>>,
 }
 
 impl NetHandler for ResourceHandler<StylesheetHandler> {
@@ -163,9 +201,28 @@ impl NetHandler for ResourceHandler<StylesheetHandler> {
         "style"
     }
 
+    // acrender
+    fn cors(&self) -> &'static str {
+        self.data.cors
+    }
+
+    // acrender: see NetHandler::opaque
+    fn opaque(&mut self) {
+        if let Some(load) = &self.data.load {
+            load.opaque.store(true, Ao::Release);
+        }
+    }
+
+    // acrender: see NetHandler::failed
+    fn failed(self: Box<Self>, resolved_url: String) {
+        self.respond(resolved_url, Err(String::from("not loaded")));
+        self.settle(&self.data.load, true);
+    }
+
     fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
         let Ok(css) = std::str::from_utf8(&bytes) else {
-            return self.respond(resolved_url, Err(String::from("Invalid UTF8")));
+            self.respond(resolved_url, Err(String::from("Invalid UTF8")));
+            return self.settle(&self.data.load, true); // acrender
         };
 
         // NOTE(Nico): I don't *think* external stylesheets should have HTML entities escaped
@@ -175,7 +232,7 @@ impl NetHandler for ResourceHandler<StylesheetHandler> {
             &crate::webkit_compat::webkit_compat(css), // acrender
             self.data.source_url.clone().into(),
             Origin::Author,
-            ServoArc::new(self.data.guard.wrap(MediaList::empty())),
+            ServoArc::new(self.data.guard.wrap(self.data.media.clone())), // acrender
             self.data.guard.clone(),
             Some(&StylesheetLoader {
                 tx: self.tx.clone(),
@@ -185,6 +242,7 @@ impl NetHandler for ResourceHandler<StylesheetHandler> {
                 abort_signal: self.data.abort_signal.clone(),
                 import_depth: 0,
                 font_sources: self.data.font_sources.clone(),
+                load: self.data.load.clone(),
             }),
             None, // error_reporter
             QuirksMode::NoQuirks,
@@ -195,6 +253,7 @@ impl NetHandler for ResourceHandler<StylesheetHandler> {
             resolved_url,
             Ok(Resource::Css(DocumentStyleSheet(ServoArc::new(sheet)))),
         );
+        self.settle(&self.data.load, false); // acrender
     }
 }
 
@@ -215,6 +274,8 @@ pub(crate) struct StylesheetLoader {
     /// (0 for a top-level stylesheet)
     pub(crate) import_depth: usize,
     pub(crate) font_sources: FontSources,
+    /// acrender: the `<link>` fetch this sheet belongs to (see SheetLoad); None for a `<style>`
+    pub(crate) load: Option<Arc<SheetLoad>>,
 }
 impl ServoStylesheetLoader for StylesheetLoader {
     fn request_stylesheet(
@@ -246,6 +307,10 @@ impl ServoStylesheetLoader for StylesheetLoader {
 
         let url = import.url.url().unwrap().clone();
         let import = ServoArc::new(lock.wrap(import));
+        // acrender: the link waits for this sheet too
+        if let Some(load) = &self.load {
+            load.pending.fetch_add(1, Ao::AcqRel);
+        }
         self.net_provider.fetch(
             self.doc_id,
             stamped_request(url.as_ref().clone(), self.abort_signal.as_ref()),
@@ -286,9 +351,16 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
         "style"
     }
 
+    // acrender: see NetHandler::failed
+    fn failed(self: Box<Self>, resolved_url: String) {
+        self.respond(resolved_url, Err(String::from("not loaded")));
+        self.settle(&self.data.loader.load, true);
+    }
+
     fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
         let Ok(css) = std::str::from_utf8(&bytes) else {
-            return self.respond(resolved_url, Err(String::from("Invalid UTF8")));
+            self.respond(resolved_url, Err(String::from("Invalid UTF8")));
+            return self.settle(&self.data.loader.load, true); // acrender
         };
 
         // NOTE(Nico): I don't *think* external stylesheets should have HTML entities escaped
@@ -320,7 +392,8 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
         );
 
         let import_rule = self.data.import_rule.clone();
-        self.respond(resolved_url, Ok(Resource::ImportedCss(import_rule, sheet)))
+        self.respond(resolved_url, Ok(Resource::ImportedCss(import_rule, sheet)));
+        self.settle(&self.data.loader.load, false); // acrender
     }
 }
 

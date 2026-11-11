@@ -371,6 +371,8 @@ pub enum SpecialElementData {
     TextInput(TextInputData),
     /// Checkbox checked state
     CheckboxInput(bool),
+    /// acrender: an \<input type=range\>'s value as a fraction of its range (0..=1)
+    RangeInput(f64),
     /// acrender: a \<select\>'s rows (see `node::select`)
     Select(Box<SelectData>),
     /// Selected files
@@ -390,6 +392,7 @@ impl Clone for SpecialElementData {
             Self::TableRoot(data) => Self::TableRoot(data.clone()),
             Self::TextInput(data) => Self::TextInput(data.clone()),
             Self::CheckboxInput(data) => Self::CheckboxInput(*data),
+            Self::RangeInput(data) => Self::RangeInput(*data),
             Self::Select(data) => Self::Select(data.clone()),
             #[cfg(feature = "file-input")]
             Self::FileInput(data) => Self::FileInput(data.clone()),
@@ -599,6 +602,13 @@ impl ElementData {
     pub fn checkbox_input_checked(&self) -> Option<bool> {
         match self.special_data {
             SpecialElementData::CheckboxInput(checked) => Some(checked),
+            _ => None,
+        }
+    }
+
+    pub fn range_input_fraction(&self) -> Option<f64> {
+        match self.special_data {
+            SpecialElementData::RangeInput(fraction) => Some(fraction),
             _ => None,
         }
     }
@@ -896,6 +906,7 @@ impl std::fmt::Debug for SpecialElementData {
             SpecialElementData::TableRoot(_) => f.write_str("NodeSpecificData::TableRoot"),
             SpecialElementData::TextInput(_) => f.write_str("NodeSpecificData::TextInput"),
             SpecialElementData::CheckboxInput(_) => f.write_str("NodeSpecificData::CheckboxInput"),
+            SpecialElementData::RangeInput(_) => f.write_str("NodeSpecificData::RangeInput"),
             SpecialElementData::Select(_) => f.write_str("NodeSpecificData::Select"),
             #[cfg(feature = "file-input")]
             SpecialElementData::FileInput(_) => f.write_str("NodeSpecificData::FileInput"),

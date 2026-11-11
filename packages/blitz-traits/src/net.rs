@@ -39,6 +39,24 @@ pub trait NetHandler: Send + Sync + 'static {
     fn destination(&self) -> &'static str {
         ""
     }
+
+    /// acrender: the CORS settings the element asks for (its `crossorigin` attribute):
+    /// "anonymous" or "use-credentials"; "" for a request that is not a CORS one
+    fn cors(&self) -> &'static str {
+        ""
+    }
+
+    /// acrender: the response about to be given to `bytes` is opaque to the page: it came from
+    /// another origin and no CORS check was made, so what is built from it may be used but not
+    /// read (a stylesheet's rules)
+    fn opaque(&mut self) {}
+
+    /// acrender: the request has no usable response (not found, refused, a status or type its
+    /// destination does not take). A handler for which no bytes and no response are the same
+    /// thing leaves this as it is; a stylesheet overrides it, an empty sheet being a loaded one
+    fn failed(self: Box<Self>, resolved_url: String) {
+        self.bytes(resolved_url, Bytes::new())
+    }
 }
 
 /// A callback which gets called every time a network request completes

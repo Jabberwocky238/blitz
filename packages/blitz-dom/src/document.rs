@@ -200,6 +200,11 @@ impl Document for Rc<RefCell<BaseDocument>> {
 
 pub enum DocumentEvent {
     ResourceLoad(ResourceLoadResponse),
+    /// acrender: one response of a `<link>`'s stylesheet fetch was sent before this (see SheetLoad)
+    SheetResponse {
+        load: Arc<crate::net::SheetLoad>,
+        failed: bool,
+    },
     /// A navigation originating from within an iframe's sub-document
     /// (e.g. a link click), to be applied to the iframe identified by `node_id`.
     NavigateIframe {
@@ -400,6 +405,16 @@ pub struct BaseDocument {
     // keyed by request id
     pub(crate) pending_critical_resources: HashSet<usize>,
 
+    /// acrender: the current stylesheet fetch of each `<link>` in the document (see SheetLoad),
+    /// and the links whose fetch has settled since `take_settled_stylesheets`
+    pub(crate) sheet_loads: HashMap<NodeId, Arc<crate::net::SheetLoad>>,
+    pub(crate) settled_sheets: Vec<NodeId>,
+    /// acrender: for the sheet each `<link>` has now, the URL it was fetched from, whether its
+    /// response was opaque (NetHandler::opaque) and the id of the request that brought it, which
+    /// tells this sheet from the one the link had before or gets later. Decided by the fetch
+    /// that made the sheet, not by what the link's attributes say later
+    pub(crate) sheet_sources: HashMap<NodeId, (String, bool, usize)>,
+
     // Service providers
     /// Network provider. Can be used to fetch assets.
     pub net_provider: Arc<dyn NetProvider>,
@@ -552,6 +567,9 @@ impl BaseDocument {
             pending_images: HashMap::new(),
             pending_style_image_nodes: Vec::new(),
             pending_critical_resources: HashSet::new(),
+            sheet_loads: HashMap::new(),
+            settled_sheets: Vec::new(),
+            sheet_sources: HashMap::new(),
             net_provider,
             navigation_provider,
             shell_provider,
@@ -1180,37 +1198,208 @@ impl BaseDocument {
     }
 
     pub fn reload_resource_by_href(&mut self, href_to_reload: &str) {
-        for &node_id in self.nodes_to_stylesheet.keys() {
-            let node = &self.nodes[node_id];
-            let Some(element) = node.element_data() else {
-                continue;
-            };
+        // acrender: through fetch_linked_stylesheet, like any other fetch of a link's sheet
+        let links: Vec<NodeId> = self
+            .nodes_to_stylesheet
+            .keys()
+            .copied()
+            .filter(|&node_id| {
+                let element = self.nodes[node_id].element_data();
+                element.is_some_and(|e| {
+                    e.name.local == local_name!("link")
+                        && e.attr(local_name!("href")) == Some(href_to_reload)
+                })
+            })
+            .collect();
+        for node_id in links {
+            self.fetch_linked_stylesheet(node_id);
+        }
+    }
 
-            if element.name.local == local_name!("link") {
-                if let Some(href) = element.attr(local_name!("href")) {
-                    // println!("Node {node_id} {href} {href_to_reload} {} {}", resolved_href.as_str(), resolved_href.as_str() == url_to_reload);
-                    if href == href_to_reload {
-                        let resolved_href = self.resolve_url(href);
-                        self.net_provider.fetch(
-                            self.id(),
-                            self.build_request(resolved_href.clone()),
-                            ResourceHandler::boxed(
-                                self.tx.clone(),
-                                self.id,
-                                Some(node_id),
-                                self.shell_provider.clone(),
-                                StylesheetHandler {
-                                    source_url: resolved_href,
-                                    guard: self.guard.clone(),
-                                    net_provider: self.net_provider.clone(),
-                                    abort_signal: self.abort_signal.clone(),
-                                    font_sources: self.font_sources.clone(),
-                                },
-                            ),
-                        );
+    /// acrender: the `media` attribute of a `<style>` / `<link>` as its sheet's media list
+    /// (no attribute, or an empty one: all media)
+    pub(crate) fn media_list_of(&self, node_id: NodeId) -> MediaList {
+        let Some(text) = self.nodes[node_id].attr(local_name!("media")) else {
+            return MediaList::empty();
+        };
+        let url_data = self.url.url_extra_data();
+        let context = style::parser::ParserContext::new(
+            Origin::Author,
+            &url_data,
+            Some(style::stylesheets::CssRuleType::Media),
+            style_traits::ParsingMode::DEFAULT,
+            QuirksMode::NoQuirks,
+            Default::default(),
+            None,
+            None,
+            Default::default(),
+        );
+        let mut context = context;
+        MediaList::parse(&mut context, &mut cssparser::Parser::new(text))
+    }
+
+    /// acrender: the `media` attribute of a `<style>` / `<link>` changed: its sheet (if it has
+    /// one) applies under the new list from now on
+    pub(crate) fn update_stylesheet_media(&mut self, node_id: NodeId) {
+        let Some(sheet) = self.nodes_to_stylesheet.get(&node_id).cloned() else {
+            return;
+        };
+        let media = self.media_list_of(node_id);
+        *sheet.0.media.write_with(&mut self.guard.write()) = media;
+        self.stylist
+            .force_stylesheet_origins_dirty(style::stylesheets::OriginSet::all());
+        self.stylesheet_generation += 1;
+    }
+
+    /// acrender: whether `node_id` is a `<link>` in the document whose `rel` has `stylesheet` and
+    /// that has an `href` (an external resource link that contributes to styling)
+    pub(crate) fn links_stylesheet(&self, node_id: NodeId) -> bool {
+        let node = &self.nodes[node_id];
+        node.flags.is_in_document()
+            && node.attr(local_name!("href")).is_some()
+            && node.attr(local_name!("rel")).is_some_and(|rels| {
+                rels.split_ascii_whitespace()
+                    .any(|rel| rel.eq_ignore_ascii_case("stylesheet"))
+            })
+    }
+
+    /// acrender: fetch the stylesheet of the `<link>` `node_id` (was in
+    /// `DocumentMutator::load_linked_stylesheet`). The fetch is recorded as the link's current
+    /// one (see SheetLoad): what an earlier fetch of this link still answers is dropped. A link
+    /// that does not link a stylesheet (any more) loses the sheet it has.
+    pub(crate) fn fetch_linked_stylesheet(&mut self, node_id: NodeId) {
+        if !self.links_stylesheet(node_id) {
+            return self.unload_linked_stylesheet(node_id);
+        }
+        let node = &self.nodes[node_id];
+        let mut is_in_head = false;
+        let mut parent_id = node.parent;
+        while let Some(id) = parent_id
+            && !is_in_head
+        {
+            let parent = &self.nodes[id];
+            is_in_head |= parent.data.is_element_with_tag_name(&local_name!("head"));
+            parent_id = parent.parent;
+        }
+
+        let url = self.resolve_url(node.attr(local_name!("href")).unwrap_or_default());
+        let mut handler = ResourceHandler::new(
+            self.tx.clone(),
+            self.id(),
+            Some(node_id),
+            self.shell_provider.clone(),
+            StylesheetHandler {
+                source_url: url.clone(),
+                guard: self.guard.clone(),
+                net_provider: self.net_provider.clone(),
+                abort_signal: self.abort_signal.clone(),
+                font_sources: self.font_sources.clone(),
+                media: self.media_list_of(node_id),
+                cors: match node.attr(local_name!("crossorigin")) {
+                    None => "",
+                    Some(value) if value.eq_ignore_ascii_case("use-credentials") => {
+                        "use-credentials"
                     }
-                }
-            }
+                    Some(_) => "anonymous",
+                },
+                load: None,
+            },
+        );
+        let load = Arc::new(crate::net::SheetLoad {
+            node: node_id,
+            request: handler.request_id(),
+            pending: AtomicUsize::new(1),
+            failed: std::sync::atomic::AtomicBool::new(false),
+            opaque: std::sync::atomic::AtomicBool::new(false),
+        });
+        handler.data.load = Some(load.clone());
+        if let Some(earlier) = self.sheet_loads.insert(node_id, load) {
+            self.pending_critical_resources.remove(&earlier.request);
+        }
+        self.settled_sheets.retain(|&id| id != node_id);
+
+        if is_in_head && !self.net_provider.is_noop() {
+            self.pending_critical_resources.insert(handler.request_id());
+        }
+
+        self.net_provider
+            .fetch(self.id(), self.build_request(url), Box::new(handler));
+    }
+
+    /// acrender: the `<link>` `node_id` stops linking a stylesheet (it left the document, lost
+    /// its href or `stylesheet` in rel): its sheet goes, and its fetch is forgotten, so what
+    /// that fetch still answers is dropped and nothing is reported for it; a fetch that is
+    /// forgotten (here or by a newer one) stops holding back the first paint
+    pub(crate) fn unload_linked_stylesheet(&mut self, node_id: NodeId) {
+        if let Some(load) = self.sheet_loads.remove(&node_id) {
+            self.pending_critical_resources.remove(&load.request);
+        }
+        self.settled_sheets.retain(|&id| id != node_id);
+        self.remove_stylesheet_of_node(node_id);
+    }
+
+    /// acrender: take the sheet of a `<style>` / `<link>` out of the stylist (was in
+    /// `DocumentMutator::unload_stylesheet`, which panicked on a node without one)
+    pub(crate) fn remove_stylesheet_of_node(&mut self, node_id: NodeId) {
+        let Some(element) = self.nodes[node_id].element_data_mut() else {
+            return;
+        };
+        if !matches!(element.special_data, SpecialElementData::Stylesheet(_)) {
+            return;
+        }
+        let SpecialElementData::Stylesheet(stylesheet) = element.special_data.take() else {
+            return;
+        };
+        self.stylist
+            .remove_stylesheet(stylesheet, &self.guard.read());
+        self.stylist
+            .force_stylesheet_origins_dirty(style::stylesheets::OriginSet::all());
+        self.nodes_to_stylesheet.remove(&node_id);
+        self.sheet_sources.remove(&node_id);
+        self.stylesheet_generation += 1;
+    }
+
+    /// acrender: the URL the sheet the `<link>` `node_id` has now was fetched from, whether the
+    /// page may not read its rules, and what tells it from the link's other sheets (see
+    /// `sheet_sources`); None when it has no sheet
+    pub fn stylesheet_source(&self, node_id: NodeId) -> Option<(&str, bool, usize)> {
+        let (url, opaque, request) = self.sheet_sources.get(&node_id)?;
+        Some((url.as_str(), *opaque, *request))
+    }
+
+    /// acrender: where the current stylesheet fetch of the `<link>` `node_id` stands: None when
+    /// it has none (not in the document, no href, rel without `stylesheet`)
+    pub fn stylesheet_load(&self, node_id: NodeId) -> Option<crate::net::SheetLoadState> {
+        use crate::net::SheetLoadState;
+        let load = self.sheet_loads.get(&node_id)?;
+        Some(if load.pending.load(Ordering::Acquire) > 0 {
+            SheetLoadState::Loading
+        } else if load.failed.load(Ordering::Acquire) {
+            SheetLoadState::Failed
+        } else {
+            SheetLoadState::Loaded
+        })
+    }
+
+    /// acrender: the links whose stylesheet fetch settled (loaded and applied, or failed) since
+    /// the last call, each once for each fetch
+    pub fn take_settled_stylesheets(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.settled_sheets)
+    }
+
+    /// acrender: one response of `load` was handled; the last one settles the link's fetch, if
+    /// it is still the link's current one
+    fn sheet_response(&mut self, load: Arc<crate::net::SheetLoad>, failed: bool) {
+        if failed {
+            load.failed.store(true, Ordering::Release);
+        }
+        let left = load.pending.fetch_sub(1, Ordering::AcqRel) - 1;
+        let current = self
+            .sheet_loads
+            .get(&load.node)
+            .is_some_and(|l| Arc::ptr_eq(l, &load));
+        if left == 0 && current {
+            self.settled_sheets.push(load.node);
         }
     }
 
@@ -1453,6 +1642,9 @@ impl BaseDocument {
             }
         }
         self.nodes_to_stylesheet.retain(|id, _| alive(id));
+        self.sheet_loads.retain(|id, _| alive(id));
+        self.sheet_sources.retain(|id, _| alive(id));
+        self.settled_sheets.retain(|id| alive(id));
         self.pending_style_image_nodes.retain(|id| alive(id));
     }
 
@@ -1460,6 +1652,8 @@ impl BaseDocument {
         let css = self.nodes[target_id].text_content();
         let css = html_escape::decode_html_entities(&css);
         let sheet = self.make_stylesheet(&css, Origin::Author);
+        // acrender: the <style>'s media attribute
+        *sheet.0.media.write_with(&mut self.guard.write()) = self.media_list_of(target_id);
         self.add_stylesheet_for_node(sheet, target_id);
     }
 
@@ -1510,6 +1704,7 @@ impl BaseDocument {
                 abort_signal: self.abort_signal.clone(),
                 import_depth: 0,
                 font_sources: self.font_sources.clone(),
+                load: None,
             }),
             None,
             QuirksMode::NoQuirks,
@@ -1618,6 +1813,7 @@ impl BaseDocument {
     pub fn handle_message(&mut self, msg: DocumentEvent) {
         match msg {
             DocumentEvent::ResourceLoad(resource) => self.load_resource(resource),
+            DocumentEvent::SheetResponse { load, failed } => self.sheet_response(load, failed),
             DocumentEvent::NavigateIframe { node_id, url } => self.navigate_iframe(node_id, url),
         }
     }
@@ -1629,6 +1825,23 @@ impl BaseDocument {
 
     pub fn load_resource(&mut self, res: ResourceLoadResponse) {
         self.pending_critical_resources.remove(&res.request_id);
+
+        // acrender: a response for a `<link>`'s sheet counts only while it answers the link's
+        // current fetch; the sheet the link had goes when that fetch fails
+        // (https://html.spec.whatwg.org/#link-type-stylesheet, "process the linked resource")
+        let sheet_of = res.node_id.filter(|id| {
+            matches!(res.result, Ok(Resource::Css(_)) | Err(_))
+                && self
+                    .sheet_loads
+                    .get(id)
+                    .is_some_and(|load| load.request == res.request_id)
+        });
+        if matches!(res.result, Ok(Resource::Css(_))) && sheet_of.is_none() {
+            return;
+        }
+        if let (Some(node_id), Err(_)) = (sheet_of, &res.result) {
+            self.remove_stylesheet_of_node(node_id);
+        }
 
         let resource = match res.result {
             Ok(resource) => resource,
@@ -1658,6 +1871,13 @@ impl BaseDocument {
             Resource::Css(css) => {
                 let node_id = res.node_id.unwrap();
                 self.add_stylesheet_for_node(css, node_id);
+                // acrender: see `sheet_sources`
+                if let Some(load) = self.sheet_loads.get(&node_id) {
+                    let opaque = load.opaque.load(Ordering::Acquire);
+                    let url = res.resolved_url.clone().unwrap_or_default();
+                    self.sheet_sources
+                        .insert(node_id, (url, opaque, load.request));
+                }
             }
             Resource::ImportedCss(import_rule, sheet) => {
                 let mut guard = self.guard.write();
@@ -2030,7 +2250,11 @@ impl BaseDocument {
             return None;
         }
 
-        let Some(hit) = self.hit(x, y) else {
+        // acrender: `hit` takes page coordinates (it starts at the root element's box, which the
+        // viewport scrolls), so the viewport's scroll offset is added; without it a scrolled page
+        // answered with whatever lay at that point before scrolling
+        let scroll = self.viewport_scroll();
+        let Some(hit) = self.hit(x + scroll.x as f32, y + scroll.y as f32) else {
             // The point is within the viewport but over no box: the root element
             // (which covers the viewport in an HTML document) is the hit target
             return self.try_root_element().map(|root| root.id);

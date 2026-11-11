@@ -338,6 +338,7 @@ impl BaseDocument {
             abort_signal: self.abort_signal.clone(),
             import_depth: 0,
             font_sources: self.font_sources.clone(),
+            load: None, // acrender: a rule inserted by script is not part of a link's fetch
         }
     }
 

@@ -6,7 +6,7 @@
 //! `transform-origin`, grid track sizes) it is the *used* value, computed from
 //! the most recent layout.
 
-use cssparser::Parser;
+use cssparser::{Parser, Token};
 use selectors::matching::QuirksMode;
 use style::computed_values::box_sizing::T as BoxSizing;
 use style::computed_values::position::T as Position;
@@ -18,7 +18,7 @@ use style::properties::{
     parse_one_declaration_into,
 };
 use style::servo_arc::Arc as ServoArc;
-use style::stylesheets::supports_rule::parse_condition_or_declaration;
+use style::stylesheets::supports_rule::{Declaration, parse_condition_or_declaration};
 use style::stylesheets::{CssRuleType, Origin, OriginSet, UrlExtraData};
 use style::stylist::RegisterCustomPropertyResult;
 use style::values::computed::length::CSSPixelLength;
@@ -296,7 +296,31 @@ impl BaseDocument {
         let Ok(condition) = parser.parse_entirely(parse_condition_or_declaration) else {
             return false;
         };
+        self.with_supports_context(|context| condition.eval(context))
+    }
 
+    /// acrender: whether `property: value` parses as a declaration, as used by the CSSOM
+    /// `CSS.supports(property, value)` API: the property is a name as written (no surrounding
+    /// white space) and, unlike a `@supports` declaration, the value takes no `!important`
+    pub fn css_supports_declaration(&self, property: &str, value: &str) -> bool {
+        if property.trim() != property {
+            return false;
+        }
+        let mut tokens = Parser::new(value);
+        while let Ok(token) = tokens.next() {
+            if matches!(token, Token::Delim('!')) {
+                return false;
+            }
+        }
+        let text = format!("{property}: {value}");
+        let mut parser = Parser::new(&text);
+        let Ok(declaration) = parser.parse_entirely(Declaration::parse) else {
+            return false;
+        };
+        self.with_supports_context(|context| declaration.eval(context))
+    }
+
+    fn with_supports_context<T>(&self, f: impl FnOnce(&ParserContext) -> T) -> T {
         let url_data = self.url.url_extra_data();
         let context = ParserContext::new(
             Origin::Author,
@@ -309,7 +333,7 @@ impl BaseDocument {
             None,
             Default::default(),
         );
-        condition.eval(&context)
+        f(&context)
     }
 
     /// Register a custom property via script (`CSS.registerProperty()`).
