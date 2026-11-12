@@ -328,6 +328,7 @@ impl LayoutPassState<'_> {
                                 .border()
                                 .resolve_or_zero(inputs.parent_size.width, resolve_calc_value);
                         let content_width = (output.size.width - pb.horizontal_axis_sum()).max(0.0);
+                        drop(style);
                         let doc = &mut *self.doc;
                         let scale = doc.viewport.scale();
                         let node = &mut doc.nodes[dom_node_id(node_id)];
