@@ -332,9 +332,15 @@ impl DocumentMutator<'_> {
 
     pub fn set_attribute(&mut self, node_id: NodeId, name: QualName, value: &str) {
         // acrender: setting an attribute to the value it already has changes nothing. Not for `value`
-        // (it resets a text input's edited text) or `style` (the CSSOM edits the declarations without
-        // touching the attribute text).
+        // (it resets a text input's edited text), `style` (the CSSOM edits the declarations without
+        // touching the attribute text) or an <img>'s `src` / `srcset` (setting them, even to the same
+        // value, loads the image again, as browsers do after a failed load).
+        let image_source = matches!(&*name.local, "src" | "srcset")
+            && self.doc.nodes[node_id]
+                .element_data()
+                .is_some_and(|e| e.name.local == local_name!("img"));
         if !matches!(&*name.local, "value" | "style")
+            && !image_source
             && self.doc.nodes[node_id]
                 .element_data()
                 .is_some_and(|e| e.attrs.iter().any(|a| a.name == name && a.value == value))
