@@ -1084,9 +1084,8 @@ impl<'doc> DocumentMutator<'doc> {
             // pending) is not loaded again on insertion
             let image_known = doc.is_image_pending(node_id)
                 || doc.nodes[node_id].element_data().is_some_and(|e| {
-                    e.image_data().is_some()
-                        || (e.image_tried.is_some()
-                            && e.image_tried.as_deref() == e.attr(local_name!("src")))
+                    e.image_tried.is_some()
+                        && e.image_tried.as_deref() == e.attr(local_name!("src"))
                 });
 
             let node = &mut doc.nodes[node_id];
@@ -1251,6 +1250,7 @@ impl<'doc> DocumentMutator<'doc> {
                     let element = node.element_data_mut().unwrap();
                     element.special_data =
                         SpecialElementData::Image(Box::new(cached_image.clone()));
+                    element.image_loads += 1; // acrender: see ElementData::image_loads
                     element.repaint(); // acrender
                     node.clear_layout_cache();
                     node.insert_damage(ALL_DAMAGE);

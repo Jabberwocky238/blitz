@@ -89,6 +89,10 @@ pub struct ElementData {
     /// acrender: the `src` an \<img\> last started loading (whatever the outcome), so
     /// inserting it into the document does not load the same source again
     pub image_tried: Option<String>,
+
+    /// acrender: how many load attempts of this \<img\> have ended (loaded, failed or taken
+    /// from the cache), so each one can fire its own load / error event
+    pub image_loads: u32,
     // /// Whether the node is a [HTML integration point] (https://html.spec.whatwg.org/multipage/#html-integration-point)
     // pub mathml_annotation_xml_integration_point: bool,
 
@@ -325,6 +329,7 @@ impl Clone for ElementData {
             list_item_data: self.list_item_data.clone(),
             template_contents: self.template_contents,
             image_tried: None,
+            image_loads: 0,
 
             // Runtime state: reset to defaults.
             stylo_element_data: Default::default(),
@@ -442,6 +447,7 @@ impl ElementData {
             special_data: SpecialElementData::None,
             template_contents: None,
             image_tried: None,
+            image_loads: 0,
             background_images: ThinVec::new(),
             mask_images: ThinVec::new(),
 

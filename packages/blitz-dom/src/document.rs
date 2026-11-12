@@ -1848,6 +1848,14 @@ impl BaseDocument {
             Err(err) => {
                 if let Some(url) = res.resolved_url.as_ref() {
                     let waiting_nodes = self.pending_images.remove(url).unwrap_or_default();
+                    // acrender: a failed attempt of an <img> ends too (see ElementData::image_loads)
+                    for (node_id, image_type) in &waiting_nodes {
+                        if matches!(image_type, ImageType::Image)
+                            && let Some(element) = self.get_node_mut(*node_id).and_then(|n| n.element_data_mut())
+                        {
+                            element.image_loads += 1;
+                        }
+                    }
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
                         url = url.as_str(),
@@ -2047,6 +2055,7 @@ impl BaseDocument {
                 ImageType::Image => {
                     let element = node.element_data_mut().unwrap();
                     element.special_data = SpecialElementData::Image(Box::new(image.clone()));
+                    element.image_loads += 1; // acrender: see ElementData::image_loads
                     element.repaint(); // acrender
 
                     // Clear layout cache
