@@ -19,6 +19,11 @@ svg|*:not(svg|foreignObject) > svg|svg {
     transform-origin: 0 0;
 }
 
+/* acrender: like Chrome (html.css) and Firefox (svg.css): an inline <svg> clips what it draws to its box */
+svg|svg:not(:root) {
+    overflow: hidden;
+}
+
 /* bidi
  *
  * The dir attribute mapping uses the attribute-selector form from the HTML

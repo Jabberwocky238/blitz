@@ -1420,6 +1420,18 @@ impl ElementCx<'_, '_> {
             return;
         };
 
+        // acrender: an inline <svg> without a viewBox is not fitted to its box: its user units are CSS px from the content
+        // box origin (its overflow clips it, see default.css)
+        if self.element.name.local == local_name!("svg") && svg.intrinsic_dimensions.view_box.is_none() {
+            let origin = self.frame.content_box.origin();
+            let inner = Affine::translate(Vec2 { x: origin.x, y: origin.y }) * Affine::scale(self.scale);
+            match self.svg_simple {
+                Some(simple) => draw_simple_svg(scene, simple, self.transform * inner),
+                None => draw_svg_tree(scene, &svg.tree, self.transform, inner),
+            }
+            return;
+        }
+
         let width = self.frame.content_box.width() as f32;
         let height = self.frame.content_box.height() as f32;
         let svg_size = svg.tree.size();

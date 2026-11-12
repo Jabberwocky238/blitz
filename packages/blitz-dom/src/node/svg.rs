@@ -235,6 +235,16 @@ impl SvgImageData {
         }
     }
 
+    /// acrender: the transform from the rendered tree to the content box (`width` x `height`) of an inline `<svg>`. Without
+    /// a `viewBox` its user units are CSS pixels from the box's origin, as in browsers (an image's SVG is stretched to its
+    /// box instead, see [`Self::viewport_transform`]); with one, the same as [`Self::viewport_transform`].
+    pub fn inline_viewport_transform(&self, width: f32, height: f32) -> usvg::Transform {
+        match self.intrinsic_dimensions.view_box {
+            None => usvg::Transform::identity(),
+            Some(_) => self.viewport_transform(width, height),
+        }
+    }
+
     /// The root `width` attribute resolved against a containing block width:
     /// percentages resolve against the containing block (`None` if it is
     /// indefinite) and an absent attribute is `None`.

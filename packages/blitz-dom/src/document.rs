@@ -4071,8 +4071,8 @@ mod font_face_override_tests {
 #[cfg(feature = "svg")]
 impl BaseDocument {
     /// acrender: an element inside an inline `<svg>` has no layout box: the outermost `<svg>` it is drawn in and its
-    /// bounding box there (usvg's, text included), as fractions of that `<svg>`'s size. For getBoundingClientRect and,
-    /// through it, getBBox.
+    /// bounding box there (usvg's, text included, placed as the paint places it), as fractions of that `<svg>`'s content box.
+    /// For getBoundingClientRect and, through it, getBBox.
     pub fn svg_box(&mut self, node_id: NodeId) -> Option<(NodeId, [f32; 4])> {
         let node = self.get_node(node_id)?;
         if node.element_data()?.name.ns != markup5ever::ns!(svg) {
@@ -4095,13 +4095,18 @@ impl BaseDocument {
         let root = root?;
         let mut source = String::new();
         let svg = &self.nodes[root];
+        let layout = svg.final_layout();
+        let w = layout.size.width - layout.border.left - layout.border.right - layout.padding.left - layout.padding.right;
+        let h = layout.size.height - layout.border.top - layout.border.bottom - layout.padding.top - layout.padding.bottom;
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
         svg.write_svg_marked(&mut source, true, svg.svg_viewport(), Some(node_id));
         let source = self.svg_with_sprites(root, source);
         let fonts = self.has_descendant(root, "text").then(|| self.svg_fonts());
         let parsed = crate::util::parse_svg_with(source.as_bytes(), fonts).ok()?;
-        let size = parsed.tree.size();
         let rect = parsed.tree.node_by_id(crate::node::SVG_BOX_ID)?.abs_bounding_box();
-        let (w, h) = (size.width(), size.height());
+        let rect = rect.transform(parsed.inline_viewport_transform(w, h))?;
         Some((root, [rect.x() / w, rect.y() / h, rect.width() / w, rect.height() / h]))
     }
 }
