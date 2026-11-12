@@ -729,6 +729,8 @@ impl NetHandler for ResourceHandler<ImageHandler> {
 
 impl ImageHandler {
     fn parse(&self, bytes: Bytes) -> Result<Resource, String> {
+        // acrender: an icon is decoded from its best entry alone (see `best_icon_entry`)
+        let bytes = best_icon_entry(&bytes).map_or(bytes, Bytes::from);
         let image_err = match image::ImageReader::new(Cursor::new(&bytes))
             .with_guessed_format()
             .expect("IO errors impossible with Cursor")
@@ -766,10 +768,90 @@ impl ImageHandler {
     }
 }
 
+/// acrender: an ICO or CUR file holds several images; browsers show the largest one, the deepest
+/// colour first among the same size (the image crate prefers colour depth over size). The chosen
+/// entry is copied into a one-entry icon for the image crate, which decodes PNG and BMP entries.
+/// `None` when the bytes are not an icon or no entry lies inside them.
+fn best_icon_entry(bytes: &[u8]) -> Option<Vec<u8>> {
+    let u16_at = |at: usize| Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+    if u16_at(0)? != 0 || !matches!(u16_at(2)?, 1 | 2) {
+        return None;
+    }
+    let count = usize::from(u16_at(4)?);
+    let best = (0..count)
+        .filter_map(|i| {
+            let at = 6 + 16 * i;
+            let side = |b: u8| if b == 0 { 256 } else { u32::from(b) };
+            let (width, height) = (side(*bytes.get(at)?), side(*bytes.get(at + 1)?));
+            let (bits, size, offset) = (
+                u16_at(at + 6)?,
+                u32_at(at + 8)? as usize,
+                u32_at(at + 12)? as usize,
+            );
+            (size > 0 && offset.checked_add(size)? <= bytes.len()).then_some((
+                (width * height, bits),
+                at,
+                size,
+                offset,
+            ))
+        })
+        .max_by_key(|(score, ..)| *score)?;
+    let (_, at, size, offset) = best;
+    let mut one = Vec::with_capacity(22 + size);
+    one.extend_from_slice(&[0, 0, 1, 0, 1, 0]);
+    one.extend_from_slice(&bytes[at..at + 12]);
+    one.extend_from_slice(&22u32.to_le_bytes());
+    one.extend_from_slice(&bytes[offset..offset + size]);
+    Some(one)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use parley::fontique::FontStyle as Fq;
+
+    fn icon(entries: &[(u8, u8, u16, &[u8])]) -> Vec<u8> {
+        let mut out = vec![0, 0, 1, 0];
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        let mut offset = 6 + 16 * entries.len();
+        for (width, height, bits, data) in entries {
+            out.extend_from_slice(&[*width, *height, 0, 0, 1, 0]);
+            out.extend_from_slice(&bits.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(offset as u32).to_le_bytes());
+            offset += data.len();
+        }
+        for (.., data) in entries {
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    #[test]
+    fn the_largest_icon_entry_is_kept_and_deeper_colour_breaks_ties() {
+        let file = icon(&[
+            (16, 16, 32, b"small"),
+            (32, 32, 8, b"big-8"),
+            (32, 32, 32, b"big32"),
+            (0, 0, 4, b""),
+        ]);
+        let one = best_icon_entry(&file).unwrap();
+        assert_eq!(&one[..6], &[0, 0, 1, 0, 1, 0]);
+        assert_eq!(
+            (one[6], one[7], u16::from_le_bytes([one[12], one[13]])),
+            (32, 32, 32)
+        );
+        assert_eq!(u32::from_le_bytes(one[18..22].try_into().unwrap()), 22);
+        assert_eq!(&one[22..], b"big32");
+        assert!(best_icon_entry(b"\x89PNG\r\n\x1a\n").is_none());
+        let mut truncated = icon(&[(16, 16, 32, b"data")]);
+        truncated.truncate(truncated.len() - 1);
+        assert!(
+            best_icon_entry(&truncated).is_none(),
+            "an entry past the end is skipped"
+        );
+    }
     use style::values::specified::Angle;
 
     fn oblique(min_deg: f32, max_deg: f32) -> FontStyleRange {
