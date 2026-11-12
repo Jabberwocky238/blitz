@@ -1073,6 +1073,11 @@ impl<'doc> DocumentMutator<'doc> {
                 doc.add_to_id_map(&id_attr, node_id);
             }
 
+            // acrender: an <img> that already has its image, or is fetching it (its src was
+            // set while it was out of the document), is not loaded again on insertion
+            let image_known = doc.is_image_pending(node_id)
+                || doc.nodes[node_id].element_data().is_some_and(|e| e.image_data().is_some());
+
             let node = &mut doc.nodes[node_id];
             let NodeData::Element(ref mut element) = node.data else {
                 return;
@@ -1086,7 +1091,7 @@ impl<'doc> DocumentMutator<'doc> {
                     self.style_nodes.insert(node_id);
                 }
                 "link" => self.eager_op_queue.push(SpecialOp::LoadStylesheet(node_id)),
-                "img" => self.eager_op_queue.push(SpecialOp::LoadImage(node_id)),
+                "img" if !image_known => self.eager_op_queue.push(SpecialOp::LoadImage(node_id)),
                 "iframe" => self.eager_op_queue.push(SpecialOp::LoadIframe(node_id)),
                 "button" | "fieldset" | "input" | "select" | "textarea" | "object" | "output" => {
                     self.eager_op_queue
