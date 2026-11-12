@@ -1073,10 +1073,15 @@ impl<'doc> DocumentMutator<'doc> {
                 doc.add_to_id_map(&id_attr, node_id);
             }
 
-            // acrender: an <img> that already has its image, or is fetching it (its src was
-            // set while it was out of the document), is not loaded again on insertion
+            // acrender: an <img> that has already started loading its current src (it was
+            // set while the element was out of the document; loaded, failed or still
+            // pending) is not loaded again on insertion
             let image_known = doc.is_image_pending(node_id)
-                || doc.nodes[node_id].element_data().is_some_and(|e| e.image_data().is_some());
+                || doc.nodes[node_id].element_data().is_some_and(|e| {
+                    e.image_data().is_some()
+                        || (e.image_tried.is_some()
+                            && e.image_tried.as_deref() == e.attr(local_name!("src")))
+                });
 
             let node = &mut doc.nodes[node_id];
             let NodeData::Element(ref mut element) = node.data else {
@@ -1224,8 +1229,12 @@ impl<'doc> DocumentMutator<'doc> {
         let node = &self.doc.nodes[target_id];
         if let Some(raw_src) = node.attr(local_name!("src")) {
             if !raw_src.is_empty() {
+                let tried = raw_src.to_owned();
                 let src = self.doc.resolve_url(raw_src);
                 let src_string = src.as_str();
+                if let Some(element) = self.doc.nodes[target_id].element_data_mut() {
+                    element.image_tried = Some(tried);
+                }
 
                 // Check cache first
                 if let Some(cached_image) = self.doc.image_cache.get(src_string) {
