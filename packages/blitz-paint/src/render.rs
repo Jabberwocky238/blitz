@@ -1770,6 +1770,16 @@ pub fn svg_picture(svg: &blitz_dom::node::SvgImageData, width: f32, height: f32)
     scene
 }
 
+/// acrender: an SVG image (a background or mask layer) under `transform`: its simple drawing commands when it has them
+/// (images load simple SVGs without a usvg tree, see blitz-dom's parse_svg_image), else its usvg tree
+#[cfg(feature = "svg")]
+pub(crate) fn draw_svg_image(scene: &mut impl PaintScene, svg: &blitz_dom::node::SvgImageData, transform: Affine) {
+    match svg.simple.as_deref() {
+        Some(simple) => draw_simple_svg(scene, simple, transform),
+        None => crate::svg::SvgPainter::draw(scene, &svg.tree, transform),
+    }
+}
+
 /// acrender: paint a simple inline SVG (see blitz-dom's simple_svg.rs)
 #[cfg(feature = "svg")]
 fn draw_simple_svg(

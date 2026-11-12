@@ -460,7 +460,7 @@ impl ElementCx<'_, '_> {
             ))
             * viewport;
 
-        crate::svg::SvgPainter::draw(scene, &svg.tree, transform);
+        super::draw_svg_image(scene, svg, transform);
     }
 
     fn draw_raster_image_layer(&self, scene: &mut impl PaintScene, layer: &ImageLayerStyles) {
