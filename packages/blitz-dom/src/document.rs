@@ -328,6 +328,8 @@ pub struct BaseDocument {
     // TODO: collapse animating state into a bitflags
     /// Whether there are active CSS animations/transitions (so we should re-render every frame)
     pub(crate) has_active_animations: bool,
+    /// acrender: events of CSS animations and transitions, queued once the page has asked for them
+    pub(crate) animation_events: crate::animation_events::AnimationEvents,
     /// Whether there are subdocuments that are animating (so we should re-render every frame)
     pub(crate) subdoc_is_animating: bool,
 
@@ -541,6 +543,7 @@ impl BaseDocument {
             active_node_id: None,
             mousedown_node_id: None,
             has_active_animations: false,
+            animation_events: Default::default(),
             subdoc_is_animating: false,
             sub_document_nodes: HashSet::new(),
             canvas_pictures: HashMap::new(),
@@ -2725,6 +2728,16 @@ impl BaseDocument {
         self.get_node_mut(node_id)
             .and_then(|node| node.element_data_mut())
             .and_then(|el| el.sub_doc_data_mut())
+    }
+
+    /// acrender: the queued CSS animation and transition events; from the first call on, they are queued
+    pub fn take_animation_events(&mut self) -> Vec<crate::AnimationEvent> {
+        self.animation_events.take()
+    }
+
+    /// acrender: whether CSS animations or transitions are running or about to
+    pub fn has_css_animations(&self) -> bool {
+        self.has_active_animations
     }
 
     pub fn is_animating(&self) -> bool {

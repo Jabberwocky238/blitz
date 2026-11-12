@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use crate::StyleThreading;
+use crate::animation_events::{self, AnimationEventKind};
 use crate::layout::damage::compute_layout_damage;
 use crate::node::Node;
 use crate::node::NodeData;
@@ -121,6 +122,17 @@ impl crate::document::BaseDocument {
                 .get(node_id)
                 .is_some_and(|node| node.flags.is_in_document());
             if !in_document {
+                // acrender: a removed element's animations and running transitions are canceled
+                for animation in set.animations.iter() {
+                    if animation.state != AnimationState::Canceled && !animation_events::has_ended(animation, now) {
+                        self.animation_events.animation(key, animation, AnimationEventKind::AnimationCancel, now);
+                    }
+                }
+                for transition in set.transitions.iter() {
+                    if !matches!(transition.state, AnimationState::Canceled | AnimationState::Finished) {
+                        self.animation_events.transition(key, transition, AnimationEventKind::TransitionCancel, now);
+                    }
+                }
                 set.animations.clear();
                 set.transitions.clear();
                 continue;
@@ -131,20 +143,26 @@ impl crate::document::BaseDocument {
             for animation in set.animations.iter_mut() {
                 if animation.state == AnimationState::Pending && animation.started_at <= now {
                     animation.state = AnimationState::Running;
+                    self.animation_events.animation(key, animation, AnimationEventKind::AnimationStart, now);
                 }
-                animation.iterate_if_necessary(now);
+                if animation.iterate_if_necessary(now) {
+                    self.animation_events.animation(key, animation, AnimationEventKind::AnimationIteration, now);
+                }
 
                 if animation.state == AnimationState::Running && animation.has_ended(now) {
                     animation.state = AnimationState::Finished;
+                    self.animation_events.animation(key, animation, AnimationEventKind::AnimationEnd, now);
                 }
             }
 
             for transition in set.transitions.iter_mut() {
                 if transition.state == AnimationState::Pending && transition.start_time <= now {
                     transition.state = AnimationState::Running;
+                    self.animation_events.transition(key, transition, AnimationEventKind::TransitionStart, now);
                 }
                 if transition.state == AnimationState::Running && transition.has_ended(now) {
                     transition.state = AnimationState::Finished;
+                    self.animation_events.transition(key, transition, AnimationEventKind::TransitionEnd, now);
                 }
             }
         }
@@ -217,7 +235,20 @@ impl crate::document::BaseDocument {
             })
             .map(|(key, _)| NodeId::from_u64(key.node.id() as u64))
             .collect();
-        for set in sets.values_mut() {
+        for (key, set) in sets.iter_mut() {
+            // acrender: transitionrun for the transitions this pass made, cancel events for what it canceled
+            for animation in set.animations.iter() {
+                if animation.state == AnimationState::Canceled && !animation_events::has_ended(animation, now) {
+                    self.animation_events.animation(key, animation, AnimationEventKind::AnimationCancel, now);
+                }
+            }
+            for transition in set.transitions.iter() {
+                if transition.state == AnimationState::Canceled {
+                    self.animation_events.transition(key, transition, AnimationEventKind::TransitionCancel, now);
+                } else if transition.is_new {
+                    self.animation_events.transition(key, transition, AnimationEventKind::TransitionRun, now);
+                }
+            }
             set.clear_canceled_animations();
             for animation in set.animations.iter_mut() {
                 animation.is_new = false;

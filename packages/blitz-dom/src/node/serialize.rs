@@ -236,7 +236,7 @@ impl Node {
             )),*] };
         }
         const COUNT: usize = 18;
-        let props: [Prop; COUNT] = props! {
+        let mut props: [Prop; COUNT] = props! {
             "fill" => clone_fill, "fill-opacity" => clone_fill_opacity, "fill-rule" => clone_fill_rule,
             "stroke" => clone_stroke, "stroke-width" => clone_stroke_width, "stroke-opacity" => clone_stroke_opacity,
             "stroke-linecap" => clone_stroke_linecap, "stroke-linejoin" => clone_stroke_linejoin,
@@ -245,6 +245,15 @@ impl Node {
             "color" => clone_color, "font-family" => clone_font_family, "font-size" => clone_font_size,
             "font-weight" => clone_font_weight, "font-style" => clone_font_style,
         };
+        // acrender: colors as sRGB rgb() / rgba(): usvg reads no oklch(), lab(), color-mix() ... (Tailwind 4's palette)
+        for prop in props.iter_mut() {
+            prop.1 = match prop.0 {
+                "color" => |s: &ComputedValues| srgb_css(&s.clone_color()),
+                "fill" => |s: &ComputedValues| svg_paint_css(&s.clone_fill(), s),
+                "stroke" => |s: &ComputedValues| svg_paint_css(&s.clone_stroke(), s),
+                _ => continue,
+            };
+        }
         let NodeData::Element(e) = &self.data else {
             return None;
         };
@@ -259,7 +268,7 @@ impl Node {
             && (v.contains("currentColor") || v.contains("currentcolor"))
         {
             true => {
-                let color = color.get_or_init(|| style.clone_color().to_css_string());
+                let color = color.get_or_init(|| srgb_css(&style.clone_color()));
                 v.replace("currentColor", color)
                     .replace("currentcolor", color)
             }
@@ -405,8 +414,7 @@ impl Node {
             .resolve_current_color
             .then(|| self.primary_styles())
             .flatten()
-            .map(|style| style.clone_color())
-            .map(|color| color.to_css_string());
+            .map(|style| srgb_css(&style.clone_color()));
 
         match &self.data {
             NodeData::Document(_) => {}
@@ -518,4 +526,29 @@ pub(crate) struct SvgElement<'a> {
     pub(crate) attrs: Vec<(String, String)>,
     /// the `style` declarations
     pub(crate) css: Vec<(&'static str, String)>,
+}
+
+/// acrender: a color as `rgb()` / `rgba()` in sRGB, components clipped to its gamut
+pub(crate) fn srgb_css(color: &style::color::AbsoluteColor) -> String {
+    let c = color.to_color_space(style::color::ColorSpace::Srgb);
+    let channel = |v: f32| if v.is_nan() { 0 } else { (v.clamp(0.0, 1.0) * 255.0).round() as u8 };
+    let (r, g, b) = (channel(c.components.0), channel(c.components.1), channel(c.components.2));
+    let alpha = if c.alpha.is_nan() { 0.0 } else { c.alpha.clamp(0.0, 1.0) };
+    match alpha >= 1.0 {
+        true => format!("rgb({r},{g},{b})"),
+        false => format!("rgba({r},{g},{b},{alpha})"),
+    }
+}
+
+/// acrender: an SVG paint with its color (currentColor and color-mix() resolved) written as sRGB
+fn svg_paint_css(paint: &style::values::computed::SVGPaint, style: &style::properties::ComputedValues) -> String {
+    use style::values::generics::svg::{SVGPaintFallback, SVGPaintKind};
+    let current = style.clone_color();
+    match (&paint.kind, &paint.fallback) {
+        (SVGPaintKind::Color(color), _) => srgb_css(&color.resolve_to_absolute(&current)),
+        (SVGPaintKind::PaintServer(url), SVGPaintFallback::Color(color)) => {
+            format!("{} {}", url.to_css_string(), srgb_css(&color.resolve_to_absolute(&current)))
+        }
+        _ => paint.to_css_string(),
+    }
 }

@@ -39,6 +39,7 @@ mod document;
 /// The nodes themsleves, and their data.
 pub mod node;
 
+mod animation_events; // acrender
 mod config;
 /// CSSOM stylesheet access (`document.styleSheets`, `CSSStyleSheet`, `CSSRule`)
 mod cssom;
@@ -85,6 +86,7 @@ pub use crate::layout::text_transform::{full_size_kana, full_width};
 pub use blitz_traits::node_id::NodeId;
 // Re-export taffy: it is part of blitz-dom's public API (e.g. `Node::style`,
 // `Node::final_layout`)
+pub use animation_events::{AnimationEvent, AnimationEventKind}; // acrender
 pub use config::{DocumentConfig, StyleThreading};
 pub use document::{
     BaseDocument, BoundingRect, DocGuard, DocGuardMut, Document, MemoryStats, PlainDocument,
