@@ -455,6 +455,11 @@ impl DocumentMutator<'_> {
         // If node if not in the document, then don't apply any special behaviours
         // and simply set the attribute value
         if !node.flags.is_in_document() {
+            // acrender: except an <img>'s source, which loads in or out of a document
+            // (`new Image()` with a src fires load / error without being inserted)
+            if (tag, attr) == tag_and_attr!("img", "src") {
+                self.load_image(node_id);
+            }
             return;
         }
 
@@ -1219,6 +1224,7 @@ impl<'doc> DocumentMutator<'doc> {
 
                 // Check cache first
                 if let Some(cached_image) = self.doc.image_cache.get(src_string) {
+                    self.doc.net_provider.reused(&src, "image");
                     #[cfg(feature = "tracing")]
                     tracing::info!("Loading image {src_string} from cache");
                     let node = &mut self.doc.nodes[target_id];
@@ -1233,6 +1239,7 @@ impl<'doc> DocumentMutator<'doc> {
 
                 // Check if there's already a pending request for this URL
                 if let Some(waiting_list) = self.doc.pending_images.get_mut(src_string) {
+                    self.doc.net_provider.reused(&src, "image");
                     #[cfg(feature = "tracing")]
                     tracing::info!("Image {src_string} already pending, queueing node {target_id}");
                     waiting_list.push((target_id, ImageType::Image));

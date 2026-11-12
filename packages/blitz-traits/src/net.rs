@@ -27,6 +27,10 @@ pub trait NetProvider: Send + Sync + 'static {
     fn is_noop(&self) -> bool {
         false
     }
+
+    /// acrender: a resource was taken from the document's cache (or joined a request
+    /// already in flight) instead of being fetched, so a provider can still report it
+    fn reused(&self, _url: &Url, _destination: &'static str) {}
 }
 
 /// A type that parses raw bytes from a network request into a Data and then calls
