@@ -608,11 +608,14 @@ impl selectors::Element for BlitzNode<'_> {
             NonTSPseudoClass::Default => false,
 
             NonTSPseudoClass::InRange => false,
-            NonTSPseudoClass::Modal => false,
-            NonTSPseudoClass::Open => false,
+            // acrender: set by the page's dialog and popover code (Dom::set_open_state)
+            NonTSPseudoClass::Modal => self.element_state().contains(ElementState::MODAL),
+            NonTSPseudoClass::Open => self.element_data().is_some_and(|e| {
+                matches!(&*e.name.local, "details" | "dialog") && e.attr(local_name!("open")).is_some()
+            }),
             NonTSPseudoClass::Optional => false,
             NonTSPseudoClass::OutOfRange => false,
-            NonTSPseudoClass::PopoverOpen => false,
+            NonTSPseudoClass::PopoverOpen => self.element_state().contains(ElementState::POPOVER_OPEN),
             NonTSPseudoClass::Required => false,
             NonTSPseudoClass::UserInvalid => false,
             NonTSPseudoClass::UserValid => false,

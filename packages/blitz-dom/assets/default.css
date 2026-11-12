@@ -47,6 +47,29 @@ svg|*:not(svg|foreignObject) > svg|svg {
     display: none;
 }
 
+/* acrender: the popover rules below Gecko's pref, and a z-index for the top layer, which this engine does not have */
+dialog:popover-open {
+    display: block;
+}
+
+[popover] {
+    position: fixed;
+    inset: 0;
+    width: fit-content;
+    height: fit-content;
+    margin: auto;
+    border: solid;
+    padding: 0.25em;
+    overflow: auto;
+    color: CanvasText;
+    background-color: Canvas;
+}
+
+:popover-open,
+dialog:modal {
+    z-index: 2147483647;
+}
+
 /* https://html.spec.whatwg.org/#phrasing-content-3: only links are styled */
 a[href] {
     color: rgb(0, 0, 238);
