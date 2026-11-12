@@ -23,6 +23,8 @@ use render::BlitzDomPainter;
 
 pub use cache::{CacheStats, Change, PaintCache, Piece, Run};
 pub use render::placed;
+#[cfg(feature = "svg")]
+pub use render::svg_picture; // acrender
 
 const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
     feature = "font-embolden",

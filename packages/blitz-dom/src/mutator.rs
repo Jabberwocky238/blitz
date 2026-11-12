@@ -351,6 +351,7 @@ impl DocumentMutator<'_> {
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
         if node_is_in_document {
             self.doc.snapshot_attribute(node_id, &name);
+            self.doc.invalidate_has_for_attribute(node_id, &name, Some(value)); // acrender
         }
         if node_is_in_document && !self.restyle_for_attribute(node_id, &name) {
             let node = &mut self.doc.nodes[node_id];
@@ -506,6 +507,7 @@ impl DocumentMutator<'_> {
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
         if node_is_in_document {
             self.doc.snapshot_attribute(node_id, &name);
+            self.doc.invalidate_has_for_attribute(node_id, &name, None); // acrender
         }
         if node_is_in_document && !self.restyle_for_attribute(node_id, &name) {
             // acrender: as in `set_attribute`, the parent's subtree when :has() / nth-of may depend on it
@@ -642,6 +644,9 @@ impl DocumentMutator<'_> {
     /// Remove the node from it's parent but don't drop it
     pub fn remove_node(&mut self, node_id: NodeId) {
         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
+        if node_is_in_document {
+            self.doc.invalidate_has_for_removal(node_id); // acrender
+        }
         // Process the subtree *before* severing the parent link so that
         // interaction state referencing removed nodes can retarget to the
         // nearest surviving ancestor.
@@ -704,6 +709,12 @@ impl DocumentMutator<'_> {
     }
 
     pub fn remove_and_drop_all_children(&mut self, node_id: NodeId) {
+        // acrender
+        if self.doc.nodes[node_id].flags.is_in_document() {
+            for child_id in self.doc.nodes[node_id].children.clone() {
+                self.doc.invalidate_has_for_removal(child_id);
+            }
+        }
         let parent = &mut self.doc.nodes[node_id];
         let parent_is_in_doc = parent.flags.is_in_document();
 
@@ -785,6 +796,9 @@ impl DocumentMutator<'_> {
         // parent's child list, and anchor indices would be computed against a
         // child list that still contains the moved nodes.
         for child_id in child_ids.iter().copied() {
+            if self.doc.nodes[child_id].flags.is_in_document() {
+                self.doc.invalidate_has_for_removal(child_id); // acrender
+            }
             let child = &self.doc.nodes[child_id];
             if child.contains_focus() {
                 focus_within_old_chain = Some(self.doc.maybe_node_element_ancestors(child.parent));
@@ -842,6 +856,11 @@ impl DocumentMutator<'_> {
                 self.process_added_subtree(child_id);
             } else if !new_parent_is_in_document && child_was_in_doc {
                 self.process_removed_subtree(child_id);
+            }
+        }
+        if new_parent_is_in_document {
+            for child_id in child_ids.iter().copied() {
+                self.doc.invalidate_has_for_insertion(child_id); // acrender
             }
         }
 

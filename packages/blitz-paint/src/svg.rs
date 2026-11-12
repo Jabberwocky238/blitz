@@ -192,7 +192,106 @@ impl<'s, S: PaintScene> SvgPainter<'s, S> {
 
     /// A group, in a layer when it clips (a single-path clip-path) or blends / is translucent; `at` is the group's
     /// transform on the canvas.
+    /// acrender: a mask that is one solid, unstroked path is that path as a clip, at the alpha its fill gives the mask
+    /// (alpha masks: the fill's opacity; luminance masks: the color's luminance times that): the usual icon export
+    /// (`<mask style="mask-type:alpha"><path fill="#000" .../></mask>`). Any other mask clips to its region only;
+    /// vello takes no mask layers.
+    fn mask_clips(&mut self, g: &usvg::Group) -> usize {
+        let Some(mask) = g.mask() else { return 0 };
+        let r = mask.rect();
+        let region = Rect::new(f64::from(r.left()), f64::from(r.top()), f64::from(r.right()), f64::from(r.bottom()));
+        self.scene.push_clip_layer(Fill::NonZero, self.global * Usvg::affine(&g.abs_transform()), &region);
+        let [usvg::Node::Path(path)] = mask.root().children() else { return 1 };
+        let alpha = path.fill().filter(|_| path.stroke().is_none() && mask.mask().is_none()).and_then(|f| {
+            let usvg::Paint::Color(c) = f.paint() else { return None };
+            let coverage = match mask.kind() {
+                usvg::MaskType::Alpha => 1.0,
+                usvg::MaskType::Luminance => {
+                    (0.2125 * f32::from(c.red) + 0.7154 * f32::from(c.green) + 0.0721 * f32::from(c.blue)) / 255.0
+                }
+            };
+            Some(coverage * f.opacity().get())
+        });
+        let Some(alpha) = alpha else { return 1 };
+        let fill = path.fill().map_or(Fill::NonZero, |f| Usvg::fill(f.rule()));
+        let at = self.global * Usvg::affine(&path.abs_transform());
+        self.scene.push_layer(fill, BlendMode::default(), alpha, at, &Usvg::path(path), None, None);
+        2
+    }
+
+    /// acrender: a group's filters as the compositor's effects, in its user space (the layer's transform scales them):
+    /// Gaussian blur, drop shadow and color matrices chained from SourceGraphic, with Figma's no-op prefix (a
+    /// transparent feFlood and SourceGraphic feBlend-ed over it) let through. None for anything else (drawn unfiltered).
+    fn filter(g: &usvg::Group) -> Option<(std::sync::Arc<acde_gpu::Filter>, Rect)> {
+        use acde_gpu::{ColorMatrix, DropShadow, FilterEffect, GaussianBlur};
+        use usvg::filter::{ColorMatrixKind, Input, Kind};
+        let mut effects: Vec<FilterEffect> = Vec::new();
+        let mut region: Option<Rect> = None;
+        for filter in g.filters() {
+            let r = filter.rect();
+            let rect = Rect::new(f64::from(r.left()), f64::from(r.top()), f64::from(r.right()), f64::from(r.bottom()));
+            region = Some(region.map_or(rect, |all| all.union(rect)));
+            let mut chain: Option<&str> = None;
+            let mut transparent: Vec<&str> = Vec::new();
+            let on_chain = |input: &Input, chain: Option<&str>| match input {
+                Input::SourceGraphic => chain.is_none(),
+                Input::Reference(name) => chain == Some(name.as_str()),
+                Input::SourceAlpha => false,
+            };
+            for primitive in filter.primitives() {
+                let effect: Option<FilterEffect> = match primitive.kind() {
+                    Kind::Flood(f) if f.opacity().get() <= 0.0 => {
+                        transparent.push(primitive.result());
+                        continue;
+                    }
+                    Kind::Blend(b)
+                        if b.mode() == usvg::BlendMode::Normal
+                            && on_chain(b.input1(), chain)
+                            && matches!(b.input2(), Input::Reference(name) if transparent.contains(&name.as_str())) =>
+                    {
+                        None
+                    }
+                    Kind::GaussianBlur(b) if on_chain(b.input(), chain) && b.std_dev_x() == b.std_dev_y() => {
+                        Some(GaussianBlur { std_deviation: b.std_dev_x().get() }.into())
+                    }
+                    Kind::DropShadow(d) if on_chain(d.input(), chain) && d.std_dev_x() == d.std_dev_y() => {
+                        let c = d.color();
+                        let color = Color::from_rgba8(c.red, c.green, c.blue, (d.opacity().get() * 255.0).round() as u8);
+                        Some(DropShadow { dx: d.dx(), dy: d.dy(), std_deviation: d.std_dev_x().get(), color }.into())
+                    }
+                    Kind::ColorMatrix(m) if on_chain(m.input(), chain) => Some(match m.kind() {
+                        ColorMatrixKind::Matrix(values) => ColorMatrix(values.as_slice().try_into().ok()?).into(),
+                        ColorMatrixKind::Saturate(amount) => ColorMatrix::saturate(amount.get()).into(),
+                        ColorMatrixKind::HueRotate(degrees) => ColorMatrix::hue_rotate(degrees.to_radians()).into(),
+                        ColorMatrixKind::LuminanceToAlpha => return None,
+                    }),
+                    _ => return None,
+                };
+                effects.extend(effect);
+                chain = Some(primitive.result());
+            }
+        }
+        let region = region?;
+        (!effects.is_empty()).then(|| (std::sync::Arc::new(effects.into_iter().collect()), region))
+    }
+
     fn layered(&mut self, g: &usvg::Group, at: Affine) {
+        let masks = self.mask_clips(g);
+        let filter = Self::filter(g);
+        if let Some((filter, region)) = &filter {
+            let own = self.global * Usvg::affine(&g.abs_transform());
+            self.scene.push_layer(Fill::NonZero, BlendMode::default(), 1.0, own, region, Some(filter.clone()), None);
+        }
+        self.layered_plain(g, at);
+        if filter.is_some() {
+            self.scene.pop_layer();
+        }
+        for _ in 0..masks {
+            self.scene.pop_layer();
+        }
+    }
+
+    fn layered_plain(&mut self, g: &usvg::Group, at: Affine) {
         let (alpha, mix) = (g.opacity().get(), Usvg::mix(g.blend_mode()));
         let blend = BlendMode { mix, compose: Compose::SrcOver };
         let layer = match g.clip_path().and_then(|clip| clip.root().children().first()) {

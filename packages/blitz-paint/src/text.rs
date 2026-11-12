@@ -767,13 +767,21 @@ pub(crate) struct Ellipsis<'a> {
 }
 
 /// Synthetic emboldening for a run of `font_size` (physical px), when enabled.
-fn embolden(font_size: f32, scale: f64) -> kurbo::Vec2 {
-    if FONT_EMBOLDEN_ENABLED {
-        let fs = font_size as f64 / scale;
-        kurbo::Vec2::new((0.015125 * fs).min(0.3), (0.0121 * fs).min(0.3))
-    } else {
-        kurbo::Vec2::default()
+/// acrender: and the synthetic bold a run gets when its font has no face as heavy as asked for (`synthetic`, from
+/// fontique's synthesis), as Skia (Chrome) makes it: the outline grows by 1/24 of the size at 9 px or less, 1/32 at
+/// 36 px or more and in between linearly (SkScalerContext's fake-bold keys), half of that on each side.
+fn embolden(font_size: f32, scale: f64, synthetic: bool) -> kurbo::Vec2 {
+    let fs = font_size as f64 / scale;
+    let mut amount = match FONT_EMBOLDEN_ENABLED {
+        true => kurbo::Vec2::new((0.015125 * fs).min(0.3), (0.0121 * fs).min(0.3)),
+        false => kurbo::Vec2::default(),
+    };
+    if synthetic {
+        let ratio = 1.0 / 24.0 + (fs.clamp(9.0, 36.0) - 9.0) / 27.0 * (1.0 / 32.0 - 1.0 / 24.0);
+        let each = font_size as f64 * ratio / 2.0;
+        amount += kurbo::Vec2::new(each, each);
     }
+    amount
 }
 
 /// acrender: where `run`'s glyphs that fit before `limit` end (the run's start if none does).
@@ -794,7 +802,7 @@ fn draw_ellipsis_marker(
     scale: f64,
 ) {
     let run = marker.run();
-    let embolden = embolden(run.font_size(), scale);
+    let embolden = embolden(run.font_size(), scale, run.synthesis().embolden());
     let glyph_xform = run
         .synthesis()
         .skew()
@@ -957,7 +965,7 @@ pub(crate) fn stroke_text<'a>(
                     .or(stack.last().map(|e| e.text_color))
                     .unwrap_or(Color::BLACK);
 
-                let embolden = embolden(font_size, scale);
+                let embolden = embolden(font_size, scale, run.synthesis().embolden());
 
                 // (limit, where "…" starts) when this run is where the line gets cut
                 let cut_here = cut

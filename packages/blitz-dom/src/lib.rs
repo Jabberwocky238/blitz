@@ -41,6 +41,7 @@ pub mod node;
 
 mod animation_events; // acrender
 mod config;
+mod has; // acrender
 /// CSSOM stylesheet access (`document.styleSheets`, `CSSStyleSheet`, `CSSRule`)
 mod cssom;
 mod font_metrics;

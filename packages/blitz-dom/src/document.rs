@@ -472,6 +472,8 @@ impl BaseDocument {
         style_config::set_pref!("layout.unimplemented", true);
         // acrender: container-type and @container (sizes from the last layout, see resolve_containers)
         style_config::set_pref!("layout.container-queries.enabled", true);
+        // acrender: :has() (Tailwind's has-* variants, parent styling by state)
+        style_config::set_pref!("layout.css.has-selector.enabled", true);
         style_config::set_pref!("layout.columns.enabled", true);
         style_config::set_pref!("layout.css.basic-shape-shape.enabled", true);
         style_config::set_pref!("layout.css.tree-counting-functions.enabled", true);
@@ -1996,6 +1998,7 @@ impl BaseDocument {
     /// copied in; files not loaded yet are fetched, and `node_id` is built again when they arrive
     #[cfg(feature = "svg")]
     pub(crate) fn svg_with_sprites(&mut self, node_id: NodeId, source: String) -> String {
+        let source = self.svg_with_document_refs(source);
         let hrefs = crate::node::external_uses(&source);
         if hrefs.is_empty() {
             return source;
@@ -2031,6 +2034,50 @@ impl BaseDocument {
         }
         let sprites = &self.svg_sprites;
         crate::node::inline_external_uses(&source, |path| urls.get(path).and_then(|url| sprites.get(url).cloned().flatten()))
+    }
+
+    /// acrender: usvg resolves `<use href="#id">` and `url(#id)` only inside the SVG it parses, while a page often keeps
+    /// its `<symbol>`s and gradients in another `<svg>` (a hidden sprite sheet): copy each element referred to but not
+    /// defined into a `<defs>`, and what those refer to in turn
+    #[cfg(feature = "svg")]
+    fn svg_with_document_refs(&self, source: String) -> String {
+        let mut defs = String::new();
+        let mut done: Vec<String> = Vec::new();
+        let mut pending = crate::node::missing_local_refs(&source);
+        while let Some(id) = pending.pop() {
+            if done.contains(&id) {
+                continue;
+            }
+            done.push(id.clone());
+            let Some(node) = self.get_element_by_id(&id).and_then(|n| self.get_node(n)) else {
+                continue;
+            };
+            if node.element_data().is_none_or(|e| e.name.ns != markup5ever::ns!(svg)) {
+                continue;
+            }
+            let mut piece = String::new();
+            match node.primary_styles().is_some() {
+                true => {
+                    let mut svg = node.parent;
+                    while let Some(p) = svg.filter(|&p| self.nodes[p].element_data().is_some_and(|e| e.name.local != local_name!("svg"))) {
+                        svg = self.nodes[p].parent;
+                    }
+                    let viewport = svg.map_or((0.0, 0.0), |p| self.nodes[p].svg_viewport());
+                    node.write_svg(&mut piece, false, viewport);
+                }
+                false => node.write_svg_raw(&mut piece),
+            }
+            pending.extend(crate::node::missing_local_refs(&piece));
+            defs.push_str(&piece);
+        }
+        match (defs.is_empty(), source.rfind("</svg>")) {
+            (false, Some(end)) => {
+                let mut out = source;
+                out.insert_str(end, &format!("<defs>{defs}</defs>"));
+                out
+            }
+            _ => source,
+        }
     }
 
     /// Cache a loaded image and apply it to all nodes waiting on it
@@ -2226,6 +2273,7 @@ impl BaseDocument {
         if self.style_depends_on_state(state) {
             self.snapshot_node_state_only(node_id);
         }
+        self.invalidate_has_for_state(node_id, state); // acrender
         cb(&mut self.nodes[node_id]);
     }
 
@@ -3085,6 +3133,11 @@ impl BaseDocument {
             let layout_ctx = &mut self.layout_ctx;
             let driver = text_input.editor.driver(&mut font_ctx, layout_ctx);
             cb(driver)
+        }
+        // acrender: a box sized to its text (`field-sizing: content`) is laid out again when the text changes
+        if crate::layout::field_sized(node) {
+            node.clear_layout_cache();
+            node.insert_damage(ALL_DAMAGE);
         }
     }
 
@@ -4012,5 +4065,43 @@ mod font_face_override_tests {
         let bold = document.make_stylesheet(bold, Origin::Author);
         document.add_stylesheet_for_node(bold, style);
         assert_eq!(net.0.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[cfg(feature = "svg")]
+impl BaseDocument {
+    /// acrender: an element inside an inline `<svg>` has no layout box: the outermost `<svg>` it is drawn in and its
+    /// bounding box there (usvg's, text included), as fractions of that `<svg>`'s size. For getBoundingClientRect and,
+    /// through it, getBBox.
+    pub fn svg_box(&mut self, node_id: NodeId) -> Option<(NodeId, [f32; 4])> {
+        let node = self.get_node(node_id)?;
+        if node.element_data()?.name.ns != markup5ever::ns!(svg) {
+            return None;
+        }
+        let mut root = None;
+        let mut current = node.parent;
+        while let Some(parent) = current {
+            let n = &self.nodes[parent];
+            match n.element_data() {
+                Some(e) if e.name.ns == markup5ever::ns!(svg) => {
+                    if e.name.local == local_name!("svg") {
+                        root = Some(parent);
+                    }
+                    current = n.parent;
+                }
+                _ => break,
+            }
+        }
+        let root = root?;
+        let mut source = String::new();
+        let svg = &self.nodes[root];
+        svg.write_svg_marked(&mut source, true, svg.svg_viewport(), Some(node_id));
+        let source = self.svg_with_sprites(root, source);
+        let fonts = self.has_descendant(root, "text").then(|| self.svg_fonts());
+        let parsed = crate::util::parse_svg_with(source.as_bytes(), fonts).ok()?;
+        let size = parsed.tree.size();
+        let rect = parsed.tree.node_by_id(crate::node::SVG_BOX_ID)?.abs_bounding_box();
+        let (w, h) = (size.width(), size.height());
+        Some((root, [rect.x() / w, rect.y() / h, rect.width() / w, rect.height() / h]))
     }
 }

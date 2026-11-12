@@ -232,6 +232,7 @@ impl LayoutPassState<'_> {
         let video_size = self.video_sizes.get(&dom_node_id(node_id)).copied(); // acrender
         let node = &mut self.nodes[dom_node_id(node_id)];
         let native_appearance = node.has_native_appearance(); // acrender
+        let content_sized = field_sized(node); // acrender
 
         let font_styles = node.primary_styles().map(|style| {
             use style::values::computed::font::LineHeight;
@@ -294,27 +295,38 @@ impl LayoutPassState<'_> {
                         .attr(local_name!("cols"))
                         .and_then(|val| val.parse::<f32>().ok());
 
-                    let output = compute_leaf_layout(
+                    let line_height = resolved_line_height.unwrap_or(16.0);
+                    // acrender: `field-sizing: content` sizes the box to its text (rows and cols ignored)
+                    let wrap = content_sized.then(|| text_field_wrap(node, inputs));
+                    let content = wrap.map(|wrap| {
+                        measure_text_field(self.doc, dom_node_id(node_id), wrap)
+                            .map(|(width, height)| (width, height.max(line_height)))
+                            .unwrap_or((0.0, line_height))
+                    });
+                    let node = &self.doc.nodes[dom_node_id(node_id)];
+                    let style = node.layout_style();
+                    let mut output = compute_leaf_layout(
                         inputs,
-                        &node.layout_style(),
+                        &style,
                         resolve_calc_value,
-                        |_known_size, _available_space| taffy::Size {
-                            width: cols
-                                .map(|cols| cols * font_size.unwrap_or(16.0) * 0.6)
-                                .unwrap_or(300.0),
-                            height: resolved_line_height.unwrap_or(16.0) * rows,
+                        |_known_size, _available_space| match content {
+                            Some((width, height)) => taffy::Size { width, height },
+                            None => taffy::Size {
+                                width: cols
+                                    .map(|cols| cols * font_size.unwrap_or(16.0) * 0.6)
+                                    .unwrap_or(300.0),
+                                height: line_height * rows,
+                            },
                         },
                     );
                     if inputs.run_mode == RunMode::PerformLayout {
-                        let pb = {
-                            let style = node.layout_style();
-                            style
-                                .padding()
-                                .resolve_or_zero(inputs.parent_size.width, resolve_calc_value)
-                                + style
-                                    .border()
-                                    .resolve_or_zero(inputs.parent_size.width, resolve_calc_value)
-                        };
+                        let padding = style
+                            .padding()
+                            .resolve_or_zero(inputs.parent_size.width, resolve_calc_value);
+                        let pb = padding
+                            + style
+                                .border()
+                                .resolve_or_zero(inputs.parent_size.width, resolve_calc_value);
                         let content_width = (output.size.width - pb.horizontal_axis_sum()).max(0.0);
                         let doc = &mut *self.doc;
                         let scale = doc.viewport.scale();
@@ -330,6 +342,14 @@ impl LayoutPassState<'_> {
                             if let Some(placeholder) = input.placeholder.as_mut() {
                                 placeholder.set_width(Some(content_width * scale));
                                 placeholder.refresh_layout(font_ctx, &mut doc.layout_ctx);
+                            }
+                            // acrender: the text scrolls inside the box, so scrollHeight covers all of it
+                            // (chat composers grow the box to its scrollHeight)
+                            if let Some(text) = input.editor.try_layout() {
+                                output.scrollable_overflow_rect.bottom = output
+                                    .scrollable_overflow_rect
+                                    .bottom
+                                    .max(padding.top + text.height() / scale + padding.bottom);
                             }
                         }
                     }
@@ -388,6 +408,24 @@ impl LayoutPassState<'_> {
                                         width: min_size,
                                         height: min_size,
                                     }
+                                },
+                            );
+                        }
+                        None | Some("text" | "password" | "email" | "tel" | "url" | "search")
+                            if content_sized =>
+                        {
+                            // acrender: `field-sizing: content`: as wide as its text, plus the caret
+                            let line_height = resolved_line_height.unwrap_or(16.0);
+                            let (width, _) =
+                                measure_text_field(self.doc, dom_node_id(node_id), None).unwrap_or((0.0, 0.0));
+                            let node = &self.doc.nodes[dom_node_id(node_id)];
+                            return compute_leaf_layout(
+                                inputs,
+                                &node.layout_style(),
+                                resolve_calc_value,
+                                |_known_size, _available_space| taffy::Size {
+                                    width: width + 1.0,
+                                    height: line_height,
                                 },
                             );
                         }
@@ -955,4 +993,52 @@ impl Iterator for RefCellChildIter<'_> {
             }
         }
     }
+}
+
+/// acrender: whether `field-sizing: content` applies
+pub(crate) fn field_sized(node: &Node) -> bool {
+    use style::computed_values::field_sizing::T as FieldSizing;
+    node.primary_styles()
+        .is_some_and(|style| style.clone_field_sizing() == FieldSizing::Content)
+}
+
+/// acrender: the content width a `field-sizing: content` textarea wraps its text at: the width it is given, its
+/// definite `width`, or the space there is (None: unwrapped, for its max-content size)
+fn text_field_wrap(node: &Node, inputs: taffy::tree::LayoutInput) -> Option<f32> {
+    use taffy::MaybeResolve as _;
+    let style = node.layout_style();
+    let parent = inputs.parent_size.width;
+    let pb = (style.padding().resolve_or_zero(parent, resolve_calc_value)
+        + style.border().resolve_or_zero(parent, resolve_calc_value))
+    .horizontal_axis_sum();
+    let border_box = style.box_sizing() == taffy::BoxSizing::BorderBox;
+    let given = inputs.known_dimensions.width.map(|w| w - pb).or_else(|| {
+        style
+            .size()
+            .width
+            .maybe_resolve(parent, resolve_calc_value)
+            .map(|w| if border_box { w - pb } else { w })
+    });
+    match (given, inputs.available_space.width) {
+        (Some(width), _) => Some(width.max(0.0)),
+        (None, AvailableSpace::Definite(limit)) => Some((limit - pb).max(0.0)),
+        (None, AvailableSpace::MinContent) => Some(0.0),
+        (None, AvailableSpace::MaxContent) => None,
+    }
+}
+
+/// acrender: the text of a text input or textarea (its placeholder while the value is empty) laid out at `width`
+/// (None: unwrapped): its widest line and its height, in CSS px
+fn measure_text_field(doc: &mut BaseDocument, node: crate::NodeId, width: Option<f32>) -> Option<(f32, f32)> {
+    let scale = doc.viewport.scale();
+    let BaseDocument { nodes, font_ctx, layout_ctx, .. } = doc;
+    let input = nodes[node].data.downcast_element_mut()?.text_input_data_mut()?;
+    let editor = match (input.editor.raw_text().is_empty(), input.placeholder.as_mut()) {
+        (true, Some(placeholder)) => placeholder,
+        _ => &mut input.editor,
+    };
+    editor.set_width(width.map(|w| w * scale));
+    editor.refresh_layout(&mut font_ctx.lock().unwrap(), layout_ctx);
+    let layout = editor.try_layout()?;
+    Some((layout.full_width() / scale, layout.height() / scale))
 }

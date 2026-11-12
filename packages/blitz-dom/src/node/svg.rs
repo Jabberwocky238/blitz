@@ -362,6 +362,28 @@ pub(crate) fn external_uses(source: &str) -> Vec<String> {
     hrefs
 }
 
+/// acrender: the ids `source` refers to (`href="#id"`, `xlink:href="#id"`, `url(#id)`) that it does not define
+pub(crate) fn missing_local_refs(source: &str) -> Vec<String> {
+    let defined = |id: &str| source.contains(&format!("id=\"{id}\"")) || source.contains(&format!("id='{id}'"));
+    let mut refs: Vec<String> = Vec::new();
+    let mut add = |id: &str| {
+        let id = id.trim();
+        if !id.is_empty() && !defined(id) && !refs.iter().any(|known| known == id) {
+            refs.push(id.to_owned());
+        }
+    };
+    for (pattern, end) in [("href=\"#", '"'), ("href='#", '\''), ("url(#", ')'), ("url(\"#", '"'), ("url('#", '\'')] {
+        let mut rest = source;
+        while let Some(at) = rest.find(pattern) {
+            rest = &rest[at + pattern.len()..];
+            if let Some(stop) = rest.find(end) {
+                add(&rest[..stop]);
+            }
+        }
+    }
+    refs
+}
+
 /// acrender: usvg resolves `<use>` only inside the same document; copy each element an external `<use>`
 /// points at (from `sprite(path)`, the loaded file) into a `<defs>` of `source` under a local id
 pub(crate) fn inline_external_uses(source: &str, sprite: impl Fn(&str) -> Option<Arc<str>>) -> String {
@@ -422,5 +444,11 @@ mod sprite_tests {
         assert!(!inlined.contains("symbol id=\"x\""));
         assert!(usvg::Tree::from_str(&inlined, &usvg::Options::default()).is_ok());
         assert_eq!(inline_external_uses(PAGE, |_| None), PAGE);
+    }
+
+    #[test]
+    fn references_this_svg_does_not_define() {
+        let source = r##"<svg><use href="#a"/><use xlink:href='#b'/><rect fill="url(#g)" stroke="url('#h')"/><g id="a"/></svg>"##;
+        assert_eq!(missing_local_refs(source), ["b", "g", "h"]);
     }
 }

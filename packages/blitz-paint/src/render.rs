@@ -1757,6 +1757,19 @@ fn draw_svg_tree(scene: &mut impl PaintScene, tree: &usvg::Tree, transform: Affi
     scene.append_scene(local, transform);
 }
 
+/// acrender: an SVG image drawn into its own scene at `width` x `height`, its viewport fitted as for an `<img>` of that
+/// size (a canvas's drawImage of an SVG `<img>`)
+#[cfg(feature = "svg")]
+pub fn svg_picture(svg: &blitz_dom::node::SvgImageData, width: f32, height: f32) -> acde_gpu::Scene {
+    let mut scene = acde_gpu::Scene::new();
+    let viewport = svg_viewport_affine(svg, width, height);
+    match svg.simple.as_deref() {
+        Some(simple) => draw_simple_svg(&mut scene, simple, viewport),
+        None => draw_svg_tree(&mut scene, &svg.tree, Affine::IDENTITY, viewport),
+    }
+    scene
+}
+
 /// acrender: paint a simple inline SVG (see blitz-dom's simple_svg.rs)
 #[cfg(feature = "svg")]
 fn draw_simple_svg(

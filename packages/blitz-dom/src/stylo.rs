@@ -999,7 +999,12 @@ impl<'a> TElement for BlitzNode<'a> {
                 .iter()
                 .filter(|attr| attr.name.ns == ns!() && SVG_PRESENTATION.contains(&&*attr.name.local))
                 .filter(|attr| !attr.value.contains("url("))
-                .map(|attr| format!("{}:{};", &*attr.name.local, attr.value.replace(';', "")))
+                .map(|attr| {
+                    // acrender: font-size="20" is in user units; CSS font-size takes no bare number
+                    let value = attr.value.replace(';', "");
+                    let unitless = &*attr.name.local == "font-size" && value.trim().parse::<f32>().is_ok();
+                    format!("{}:{}{};", &*attr.name.local, value.trim(), if unitless { "px" } else { "" })
+                })
                 .collect();
             if !css.is_empty() {
                 let block = style::properties::declaration_block::parse_style_attribute(
@@ -1373,7 +1378,7 @@ impl<'a> TElement for BlitzNode<'a> {
     where
         F: FnMut(&AtomIdent),
     {
-        todo!()
+        // acrender: no custom states (has_custom_state is false); :has() invalidation walks them
     }
 
     fn has_selector_flags(&self, flags: ElementSelectorFlags) -> bool {
@@ -1704,4 +1709,5 @@ const SVG_PRESENTATION: &[&str] = &[
     "font-size",
     "font-weight",
     "font-style",
+    "mask-type",
 ];
