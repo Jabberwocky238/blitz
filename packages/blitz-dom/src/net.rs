@@ -771,13 +771,18 @@ impl ImageHandler {
 /// acrender: an ICO or CUR file holds several images; browsers show the largest one, the deepest
 /// colour first among the same size (the image crate prefers colour depth over size). The chosen
 /// entry is copied into a one-entry icon for the image crate, which decodes PNG and BMP entries.
+/// In a CUR file bytes 4-7 of an entry are the hotspot, not planes and bit depth: cursors are
+/// ranked by size alone, and the copy says 1 plane and depth 0 (unknown) as an icon would (the
+/// image crate refuses values over 256 there and reads the depth from the image data).
 /// `None` when the bytes are not an icon or no entry lies inside them.
 fn best_icon_entry(bytes: &[u8]) -> Option<Vec<u8>> {
     let u16_at = |at: usize| Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?));
     let u32_at = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
-    if u16_at(0)? != 0 || !matches!(u16_at(2)?, 1 | 2) {
-        return None;
-    }
+    let cursor = match (u16_at(0)?, u16_at(2)?) {
+        (0, 1) => false,
+        (0, 2) => true,
+        _ => return None,
+    };
     let count = usize::from(u16_at(4)?);
     let best = (0..count)
         .filter_map(|i| {
@@ -785,7 +790,7 @@ fn best_icon_entry(bytes: &[u8]) -> Option<Vec<u8>> {
             let side = |b: u8| if b == 0 { 256 } else { u32::from(b) };
             let (width, height) = (side(*bytes.get(at)?), side(*bytes.get(at + 1)?));
             let (bits, size, offset) = (
-                u16_at(at + 6)?,
+                if cursor { 0 } else { u16_at(at + 6)? },
                 u32_at(at + 8)? as usize,
                 u32_at(at + 12)? as usize,
             );
@@ -800,7 +805,13 @@ fn best_icon_entry(bytes: &[u8]) -> Option<Vec<u8>> {
     let (_, at, size, offset) = best;
     let mut one = Vec::with_capacity(22 + size);
     one.extend_from_slice(&[0, 0, 1, 0, 1, 0]);
-    one.extend_from_slice(&bytes[at..at + 12]);
+    one.extend_from_slice(&bytes[at..at + 4]);
+    one.extend_from_slice(if cursor {
+        &[1, 0, 0, 0]
+    } else {
+        &bytes[at + 4..at + 8]
+    });
+    one.extend_from_slice(&bytes[at + 8..at + 12]);
     one.extend_from_slice(&22u32.to_le_bytes());
     one.extend_from_slice(&bytes[offset..offset + size]);
     Some(one)
@@ -851,6 +862,22 @@ mod tests {
             best_icon_entry(&truncated).is_none(),
             "an entry past the end is skipped"
         );
+    }
+
+    #[test]
+    fn a_cursor_is_ranked_by_size_and_copied_as_an_icon_without_its_hotspot() {
+        let mut file = icon(&[(32, 32, 1, b"big"), (16, 16, 300, b"small")]);
+        file[2] = 2;
+        file[10..12].copy_from_slice(&400u16.to_le_bytes());
+        let one = best_icon_entry(&file).unwrap();
+        assert_eq!(&one[..6], &[0, 0, 1, 0, 1, 0], "an icon with one entry");
+        assert_eq!(
+            (one[6], one[7]),
+            (32, 32),
+            "the larger cursor, though the smaller one's hotspot y is higher"
+        );
+        assert_eq!(&one[10..14], &[1, 0, 0, 0], "1 plane, depth unknown");
+        assert_eq!(&one[22..], b"big");
     }
     use style::values::specified::Angle;
 
