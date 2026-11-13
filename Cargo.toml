@@ -62,7 +62,7 @@ skrifa = { version = "0.44", default-features = false, features = [
 ] } # Should match parley and vello versions
 
 # acrender: the 2D scene is acdert's acde-gpu (anyrender is gone); blitz paints straight into its PaintScene
-acde-gpu = { path = "../../crates/gpu", version = "0.0.9", registry = "ac" }
+acde-gpu = { path = "../../crates/gpu", version = "0.0.10", registry = "ac" }
 
 # Linebender + Fontations + SVG
 color = "0.3"
