@@ -1,0 +1,4 @@
+# ac: the AC organisation's cargo registry on gitea.dopamine, where this fork, acdert and taffy are published
+[registries.ac]
+index = "sparse+http://gitea.dopamine/api/packages/AC/cargo/"
+credential-provider = "cargo:token"

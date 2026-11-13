@@ -19,11 +19,11 @@ rust-version = "1.91.0"
 
 [workspace.dependencies]
 # Blitz dependencies(in-repo)
-blitz-dom = { version = "=0.3.0-beta.4", path = "./packages/blitz-dom", default-features = false }
-blitz-paint = { version = "=0.3.0-beta.4", path = "./packages/blitz-paint", default-features = false }
-blitz-traits = { version = "=0.3.0-beta.4", path = "./packages/blitz-traits", default-features = false }
-stylo_taffy = { version = "=0.3.0-beta.4", path = "./packages/stylo_taffy", default-features = false }
-debug_timer = { version = "0.1.2", path = "./packages/debug_timer" }
+blitz-dom = { version = "=0.3.0-beta.4", path = "./packages/blitz-dom", registry = "ac", default-features = false }
+blitz-paint = { version = "=0.3.0-beta.4", path = "./packages/blitz-paint", registry = "ac", default-features = false }
+blitz-traits = { version = "=0.3.0-beta.4", path = "./packages/blitz-traits", registry = "ac", default-features = false }
+stylo_taffy = { version = "=0.3.0-beta.4", path = "./packages/stylo_taffy", registry = "ac", default-features = false }
+debug_timer = { version = "0.1.3", path = "./packages/debug_timer", registry = "ac" }
 
 # Servo dependencies
 style = { version = "0.22.0", package = "stylo" }
@@ -45,7 +45,8 @@ smallvec = "1"
 thin-vec = "0.2"
 
 # Taffy + Parley + Fontations
-taffy = { git = "https://github.com/DioxusLabs/taffy", rev = "4e59968eda29ceeb0bbaeb3993c8cd38baa3d0a6", default-features = false, features = [
+# acdert: DioxusLabs/taffy at upstream Blitz's git revision 4e59968, published to ac as 0.15.0-git.4e59968
+taffy = { version = "=0.15.0-git.4e59968", registry = "ac", default-features = false, features = [
     "std",
     "flexbox",
     "flexbox_balance",
@@ -61,7 +62,7 @@ skrifa = { version = "0.44", default-features = false, features = [
 ] } # Should match parley and vello versions
 
 # acrender: the 2D scene is acdert's acde-gpu (anyrender is gone); blitz paints straight into its PaintScene
-acde-gpu = { path = "../../crates/gpu" }
+acde-gpu = { path = "../../crates/gpu", version = "0.0.9", registry = "ac" }
 
 # Linebender + Fontations + SVG
 color = "0.3"
@@ -102,10 +103,3 @@ icu_locale_core = { version = "2.3", default-features = false }
 icu_properties = { version = "2.3", default-features = false, features = ["compiled_data"] }
 icu_segmenter = { version = "2.3", default-features = false, features = ["compiled_data"] }
 writeable = { version = "0.6", default-features = false }
-
-# acrender: the same patched crates as acde-base's root workspace (../), so this workspace builds what acde-base builds
-[patch.crates-io]
-stylo = { path = "../stylo" }
-stylo_atoms = { path = "../stylo_atoms" }
-parley = { path = "../parley" }
-fontique = { path = "../fontique" }
