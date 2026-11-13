@@ -5,21 +5,15 @@ use blitz_dom::local_name;
 use kurbo::{Affine, BezPath, Cap, Circle, Join, Point, RoundedRect, Stroke, Vec2};
 use peniko::Fill;
 use style::dom::TElement as _;
-use style::values::generics::color::GenericColorOrAuto;
 
 impl ElementCx<'_, '_> {
-    // acrender: checkboxes, radio buttons and range inputs take `accent-color`
-    // (https://drafts.csswg.org/css-ui-4/#widget-accent); `auto` keeps the text colour
+    // acrender: checkboxes, radio buttons and range inputs are drawn in the text colour (stylo's servo build has no
+    // `accent-color`)
     fn accent_color(&self, disabled: bool) -> Color {
         if disabled {
             return Color::from_rgba8(209, 209, 209, 255);
         }
-        let current_color = self.style.clone_color();
-        match self.style.clone_accent_color() {
-            GenericColorOrAuto::Color(color) => color.resolve_to_absolute(&current_color),
-            GenericColorOrAuto::Auto => current_color,
-        }
-        .as_srgb_color()
+        self.style.clone_color().as_srgb_color()
     }
 
     pub(super) fn draw_input(&self, scene: &mut impl PaintScene) {

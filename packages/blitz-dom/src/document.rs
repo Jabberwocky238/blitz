@@ -3134,11 +3134,6 @@ impl BaseDocument {
             let driver = text_input.editor.driver(&mut font_ctx, layout_ctx);
             cb(driver)
         }
-        // acrender: a box sized to its text (`field-sizing: content`) is laid out again when the text changes
-        if crate::layout::field_sized(node) {
-            node.clear_layout_cache();
-            node.insert_damage(ALL_DAMAGE);
-        }
     }
 
     // Text selection methods

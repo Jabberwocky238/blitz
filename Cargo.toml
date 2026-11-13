@@ -45,8 +45,7 @@ smallvec = "1"
 thin-vec = "0.2"
 
 # Taffy + Parley + Fontations
-# acrender: taffy at upstream Blitz's git revision 4e59968, vendored (vendors/taffy): builds need crates.io only
-taffy = { version = "0.15.0", path = "../taffy", default-features = false, features = [
+taffy = { git = "https://github.com/DioxusLabs/taffy", rev = "4e59968eda29ceeb0bbaeb3993c8cd38baa3d0a6", default-features = false, features = [
     "std",
     "flexbox",
     "flexbox_balance",

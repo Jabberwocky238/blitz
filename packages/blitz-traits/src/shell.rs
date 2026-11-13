@@ -71,8 +71,6 @@ pub enum ColorScheme {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Viewport {
     pub color_scheme: ColorScheme,
-    /// acrender: `prefers-reduced-motion: reduce`
-    pub reduced_motion: bool,
     pub window_size: (u32, u32),
     pub hidpi_scale: f32,
     pub zoom: f32,
@@ -85,7 +83,6 @@ impl Default for Viewport {
             hidpi_scale: 1.0,
             zoom: 1.0,
             color_scheme: ColorScheme::Light,
-            reduced_motion: false,
         }
     }
 }
@@ -102,7 +99,6 @@ impl Viewport {
             hidpi_scale: scale_factor,
             zoom: 1.0,
             color_scheme,
-            reduced_motion: false,
         }
     }
 
