@@ -21,7 +21,7 @@ use crate::kurbo_css::NonUniformRoundedRectRadii;
 use crate::layers;
 use crate::sizing::compute_object_fit;
 use crate::text::DrawTextContext;
-use acde_gpu::{PaintScene, Scene};
+use acgpu::base::{PaintScene, Scene};
 use blitz_dom::node::{
     ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextInputData,
     TextLayout, TextNodeData,
@@ -105,7 +105,7 @@ impl<'a> PhysicalTracks<'a> {
 }
 
 /// acrender: `command` with `transform` applied on top of its own
-pub fn placed(command: acde_gpu::RenderCommand, transform: Affine) -> acde_gpu::RenderCommand {
+pub fn placed(command: acgpu::base::RenderCommand, transform: Affine) -> acgpu::base::RenderCommand {
     command.transformed(transform)
 }
 
@@ -1764,7 +1764,7 @@ fn create_css_box(
 /// (a cached paint fragment is recorded in local space and placed later): render relative to the
 /// element and append, so it is the same either way.
 fn draw_svg_tree(scene: &mut impl PaintScene, tree: &usvg::Tree, transform: Affine, inner: Affine) {
-    let mut local = acde_gpu::Scene::new();
+    let mut local = acgpu::base::Scene::new();
     crate::svg::SvgPainter::draw(&mut local, tree, inner);
     scene.append_scene(local, transform);
 }
@@ -1772,8 +1772,8 @@ fn draw_svg_tree(scene: &mut impl PaintScene, tree: &usvg::Tree, transform: Affi
 /// acrender: an SVG image drawn into its own scene at `width` x `height`, its viewport fitted as for an `<img>` of that
 /// size (a canvas's drawImage of an SVG `<img>`)
 #[cfg(feature = "svg")]
-pub fn svg_picture(svg: &blitz_dom::node::SvgImageData, width: f32, height: f32) -> acde_gpu::Scene {
-    let mut scene = acde_gpu::Scene::new();
+pub fn svg_picture(svg: &blitz_dom::node::SvgImageData, width: f32, height: f32) -> acgpu::base::Scene {
+    let mut scene = acgpu::base::Scene::new();
     let viewport = svg_viewport_affine(svg, width, height);
     match svg.simple.as_deref() {
         Some(simple) => draw_simple_svg(&mut scene, simple, viewport),

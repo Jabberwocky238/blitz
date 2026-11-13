@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0-beta.4"
+version = "0.3.0-beta.5"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/dioxuslabs/blitz"
 repository = "https://github.com/dioxuslabs/blitz"
@@ -19,10 +19,10 @@ rust-version = "1.91.0"
 
 [workspace.dependencies]
 # Blitz dependencies(in-repo)
-blitz-dom = { version = "=0.3.0-beta.4", path = "./packages/blitz-dom", registry = "ac", default-features = false }
-blitz-paint = { version = "=0.3.0-beta.4", path = "./packages/blitz-paint", registry = "ac", default-features = false }
-blitz-traits = { version = "=0.3.0-beta.4", path = "./packages/blitz-traits", registry = "ac", default-features = false }
-stylo_taffy = { version = "=0.3.0-beta.4", path = "./packages/stylo_taffy", registry = "ac", default-features = false }
+blitz-dom = { version = "=0.3.0-beta.5", path = "./packages/blitz-dom", registry = "ac", default-features = false }
+blitz-paint = { version = "=0.3.0-beta.5", path = "./packages/blitz-paint", registry = "ac", default-features = false }
+blitz-traits = { version = "=0.3.0-beta.5", path = "./packages/blitz-traits", registry = "ac", default-features = false }
+stylo_taffy = { version = "=0.3.0-beta.5", path = "./packages/stylo_taffy", registry = "ac", default-features = false }
 debug_timer = { version = "0.1.3", path = "./packages/debug_timer", registry = "ac" }
 
 # Servo dependencies
@@ -61,8 +61,9 @@ skrifa = { version = "0.44", default-features = false, features = [
     "std",
 ] } # Should match parley and vello versions
 
-# acrender: the 2D scene is acdert's acde-gpu (anyrender is gone); blitz paints straight into its PaintScene
-acde-gpu = { path = "../../crates/gpu", version = "0.0.10", registry = "ac" }
+# acrender: the 2D scene is acgpu's (anyrender is gone); blitz paints straight into its PaintScene. No `compiler`: only
+# the scene, filters and compose types, no MLIR
+acgpu = { version = "0.1.4", registry = "ac", default-features = false }
 
 # Linebender + Fontations + SVG
 color = "0.3"

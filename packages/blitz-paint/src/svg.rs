@@ -1,10 +1,10 @@
-//! acrender: a usvg tree painted into acde-gpu's [`PaintScene`]. This was anyrender_svg 0.15 (Apache-2.0 OR MIT, the Vello
-//! authors); it moved here with the scene type when anyrender went (acde-gpu owns the scene now).
+//! acrender: a usvg tree painted into acgpu's [`PaintScene`]. This was anyrender_svg 0.15 (Apache-2.0 OR MIT, the Vello
+//! authors); it moved here with the scene type when anyrender went (acgpu owns the scene now).
 //!
 //! Missing, as before: masks, filter effects, patterns, group backgrounds; clip paths with more than one path. An
 //! unsupported node is drawn as a half-transparent red box.
 
-use acde_gpu::{Paint, PaintScene};
+use acgpu::base::{Paint, PaintScene};
 use kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Stroke};
 use peniko::color::{DynamicColor, palette};
 use peniko::{BlendMode, Blob, Color, ColorStop, Compose, Extend, Fill, Gradient, ImageAlphaType, ImageBrush, ImageData, ImageFormat, ImageQuality, Mix};
@@ -222,8 +222,8 @@ impl<'s, S: PaintScene> SvgPainter<'s, S> {
     /// acrender: a group's filters as the compositor's effects, in its user space (the layer's transform scales them):
     /// Gaussian blur, drop shadow and color matrices chained from SourceGraphic, with Figma's no-op prefix (a
     /// transparent feFlood and SourceGraphic feBlend-ed over it) let through. None for anything else (drawn unfiltered).
-    fn filter(g: &usvg::Group) -> Option<(std::sync::Arc<acde_gpu::Filter>, Rect)> {
-        use acde_gpu::{ColorMatrix, DropShadow, FilterEffect, GaussianBlur};
+    fn filter(g: &usvg::Group) -> Option<(std::sync::Arc<acgpu::base::Filter>, Rect)> {
+        use acgpu::base::{ColorMatrix, DropShadow, FilterEffect, GaussianBlur};
         use usvg::filter::{ColorMatrixKind, Input, Kind};
         let mut effects: Vec<FilterEffect> = Vec::new();
         let mut region: Option<Rect> = None;

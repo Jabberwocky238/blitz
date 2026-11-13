@@ -347,7 +347,7 @@ pub struct BaseDocument {
     pub(crate) sub_document_nodes: HashSet<NodeId>,
     /// acrender: what each `<canvas>` has drawn (2D context commands, in its bitmap's pixels), painted
     /// into its content box
-    pub(crate) canvas_pictures: HashMap<NodeId, Arc<acde_gpu::Scene>>,
+    pub(crate) canvas_pictures: HashMap<NodeId, Arc<acgpu::base::Scene>>,
     /// acrender: each `<video>`'s intrinsic size (its current frame's), laid out like an image's
     pub(crate) video_sizes: HashMap<NodeId, (f32, f32)>,
     /// acrender: simple inline SVGs built straight from the DOM (see DocumentConfig::svg_text_only)
@@ -1423,7 +1423,7 @@ impl BaseDocument {
     }
 
     /// acrender: what a `<canvas>` shows (`None`: nothing); the canvas is painted again
-    pub fn set_canvas_picture(&mut self, node_id: NodeId, picture: Option<Arc<acde_gpu::Scene>>) {
+    pub fn set_canvas_picture(&mut self, node_id: NodeId, picture: Option<Arc<acgpu::base::Scene>>) {
         match picture {
             Some(p) => _ = self.canvas_pictures.insert(node_id, p),
             None => _ = self.canvas_pictures.remove(&node_id),
@@ -1442,7 +1442,7 @@ impl BaseDocument {
         self.nodes.geometry_generation()
     }
 
-    pub fn canvas_picture(&self, node_id: NodeId) -> Option<&Arc<acde_gpu::Scene>> {
+    pub fn canvas_picture(&self, node_id: NodeId) -> Option<&Arc<acgpu::base::Scene>> {
         self.canvas_pictures.get(&node_id)
     }
 
