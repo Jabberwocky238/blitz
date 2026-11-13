@@ -202,12 +202,6 @@ impl crate::document::BaseDocument {
             style::driver::traverse_dom(&traverser, token, rayon_pool);
             nodes_needing_style_image_flush =
                 std::mem::take(traverser.nodes_needing_style_image_flush.get_mut().unwrap());
-            // acrender: new containers start with no size, so resolve_containers restyles them once laid out
-            for id in std::mem::take(traverser.containers.get_mut().unwrap()) {
-                self.container_sizes
-                    .entry(id)
-                    .or_insert((f32::NAN, f32::NAN));
-            }
         }
         self.pending_style_image_nodes
             .extend(nodes_needing_style_image_flush);
@@ -1361,20 +1355,8 @@ impl<'a> TElement for BlitzNode<'a> {
         &self,
         _display: &style::values::specified::Display,
     ) -> euclid::default::Size2D<Option<app_units::Au>> {
-        // acrender: the container's content box from the last layout (none before the first one); when
-        // layout then changes it, resolve restyles the container's subtree and lays out again
-        // (BaseDocument::resolve_containers)
-        let layout = self.final_layout();
-        if layout.size.width <= 0.0 && layout.size.height <= 0.0 {
-            return Default::default();
-        }
-        let (b, p) = (layout.border, layout.padding);
-        let width = layout.size.width - b.left - b.right - p.left - p.right;
-        let height = layout.size.height - b.top - b.bottom - p.top - p.bottom;
-        euclid::default::Size2D::new(
-            Some(app_units::Au::from_f32_px(width.max(0.0))),
-            Some(app_units::Au::from_f32_px(height.max(0.0))),
-        )
+        // FIXME: Implement container queries. For now this effectively disables them without panicking.
+        Default::default()
     }
 
     fn each_custom_state<F>(&self, _callback: F)
@@ -1472,9 +1454,6 @@ pub struct RecalcStyle<'a> {
     /// dedicated storage on the node (see `flush_image_layers_from_style`)
     /// because their style changed during this traversal.
     nodes_needing_style_image_flush: Mutex<Vec<NodeId>>,
-    /// acrender: elements restyled into size containers (`container-type` not `normal`), for
-    /// BaseDocument::resolve_containers (so it only looks at known containers)
-    containers: Mutex<Vec<NodeId>>,
 }
 
 impl<'a> RecalcStyle<'a> {
@@ -1482,7 +1461,6 @@ impl<'a> RecalcStyle<'a> {
         RecalcStyle {
             context,
             nodes_needing_style_image_flush: Mutex::new(Vec::new()),
-            containers: Mutex::new(Vec::new()),
         }
     }
 }
@@ -1503,11 +1481,6 @@ impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
             sync_pseudo_element_styles(el, &data, &self.nodes_needing_style_image_flush);
             if let Some(style) = data.styles.get_primary() {
                 el.record_out_of_flow(style);
-                // acrender: size containers, for @container queries
-                if style.get_box().container_type != style::values::computed::ContainerType::NORMAL
-                {
-                    self.containers.lock().unwrap().push(el.id);
-                }
             }
 
             if !data.damage.is_empty() {

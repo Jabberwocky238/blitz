@@ -69,55 +69,48 @@ impl BaseDocument {
         // accumulated since the last resolve as a single device rebuild.
         self.flush_pending_device_changes();
 
-        // acrender: whether layout ran, and the damage that reached the root (in any pass)
+        // acrender: whether layout ran, and the damage that reached the root
         let mut laid_out = false;
         let mut root_damage = RestyleDamage::empty();
 
-        // acrender: style .. layout again (at most twice more) when a size container came out of layout
-        // with another size than its subtree was styled for (see resolve_containers)
-        for pass in 0..3 {
-            // we need to resolve stylist first since it will need to drive our layout bits
-            self.resolve_stylist(current_time_for_animations);
-            timer.record_time("style");
+        // we need to resolve stylist first since it will need to drive our layout bits
+        self.resolve_stylist(current_time_for_animations);
+        timer.record_time("style");
 
-            // Non-incremental mode is "every node is damaged every frame": mark the
-            // whole tree and let the same damage pipeline reconstruct and relayout
-            // everything.
-            if !self.incremental_layout {
-                self.mark_all_damaged();
-                timer.record_time("mark_all");
-            }
-
-            // Propagate damage flags (from mutation and restyles) up and down the tree
-            let damage = self.propagate_damage_flags(root_node_id);
-            root_damage |= damage;
-            timer.record_time("damage");
-
-            // Fix up tree for layout (insert anonymous blocks as necessary, etc)
-            self.resolve_layout_children();
-            #[cfg(debug_assertions)]
-            self.assert_layout_parents_consistent();
-            timer.record_time("construct");
-
-            let deferred_tasks = !self.deferred_construction_nodes.is_empty();
-            self.resolve_deferred_tasks();
-            // Flush background/mask images from style to dedicated storage on the
-            // nodes whose style changed (queued by the style traversal and by
-            // pseudo-element box construction), fetching any not-yet-loaded images.
-            self.flush_pending_style_images();
-            timer.record_time("pconstruct");
-
-            // Next we resolve layout with the data resolved by stlist
-            // acrender: unless it would only replay the root's cached layout and round every node again
-            if deferred_tasks || self.needs_layout(root_node_id, damage) {
-                self.resolve_layout();
-                laid_out = true;
-            }
-            timer.record_time("layout");
-            if pass == 2 || !self.resolve_containers() {
-                break;
-            }
+        // Non-incremental mode is "every node is damaged every frame": mark the
+        // whole tree and let the same damage pipeline reconstruct and relayout
+        // everything.
+        if !self.incremental_layout {
+            self.mark_all_damaged();
+            timer.record_time("mark_all");
         }
+
+        // Propagate damage flags (from mutation and restyles) up and down the tree
+        let damage = self.propagate_damage_flags(root_node_id);
+        root_damage |= damage;
+        timer.record_time("damage");
+
+        // Fix up tree for layout (insert anonymous blocks as necessary, etc)
+        self.resolve_layout_children();
+        #[cfg(debug_assertions)]
+        self.assert_layout_parents_consistent();
+        timer.record_time("construct");
+
+        let deferred_tasks = !self.deferred_construction_nodes.is_empty();
+        self.resolve_deferred_tasks();
+        // Flush background/mask images from style to dedicated storage on the
+        // nodes whose style changed (queued by the style traversal and by
+        // pseudo-element box construction), fetching any not-yet-loaded images.
+        self.flush_pending_style_images();
+        timer.record_time("pconstruct");
+
+        // Next we resolve layout with the data resolved by stlist
+        // acrender: unless it would only replay the root's cached layout and round every node again
+        if deferred_tasks || self.needs_layout(root_node_id, damage) {
+            self.resolve_layout();
+            laid_out = true;
+        }
+        timer.record_time("layout");
         if laid_out {
             // acrender: a box whose content shrank keeps no scroll offset beyond its new end
             self.clamp_scroll_offsets();
@@ -198,38 +191,6 @@ impl BaseDocument {
                 .is_none_or(|data| data.cache.is_empty());
         self.laid_out_viewport = Some(viewport);
         needed
-    }
-
-    /// acrender: size containers (`container-type` not `normal`) whose content box changed since their
-    /// subtree was last styled get the subtree restyled; whether any did (resolve then runs style ..
-    /// layout again, so `@container` rules see this layout's sizes)
-    fn resolve_containers(&mut self) -> bool {
-        use style::values::computed::ContainerType;
-        let mut changed = Vec::new();
-        // the known containers (the style traversal adds new ones); gone or no longer containers drop out
-        self.container_sizes.retain(|id, _| {
-            self.nodes
-                .get(*id)
-                .and_then(|n| n.primary_styles())
-                .is_some_and(|s| s.get_box().container_type != ContainerType::NORMAL)
-        });
-        for (&id, &old) in &self.container_sizes {
-            let l = self.nodes[id].final_layout();
-            let size = (
-                l.size.width - l.border.left - l.border.right - l.padding.left - l.padding.right,
-                l.size.height - l.border.top - l.border.bottom - l.padding.top - l.padding.bottom,
-            );
-            if old != size {
-                changed.push((id, size));
-            }
-        }
-        for &(id, size) in &changed {
-            self.container_sizes.insert(id, size);
-            self.nodes[id].set_restyle_hint(
-                style::invalidation::element::restyle_hints::RestyleHint::RESTYLE_DESCENDANTS,
-            );
-        }
-        !changed.is_empty()
     }
 
     fn resolve_transforms(&mut self, node_id: NodeId) -> Rect {

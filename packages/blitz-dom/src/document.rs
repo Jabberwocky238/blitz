@@ -374,8 +374,6 @@ pub struct BaseDocument {
     pub(crate) image_cache: HashMap<String, ImageData>,
     /// acrender: fonts registered from @font-face loads (count, bytes), see `memory`
     pub(crate) fonts_registered: (usize, usize),
-    /// acrender: size containers' content boxes their subtrees were last styled for (resolve_containers)
-    pub(crate) container_sizes: HashMap<NodeId, (f32, f32)>,
     /// acrender: the viewport (CSS px) the last layout ran for; resolve skips layout when it has not
     /// changed and nothing needs relayout
     pub(crate) laid_out_viewport: Option<(f32, f32)>,
@@ -561,7 +559,6 @@ impl BaseDocument {
             deferred_construction_nodes: Vec::new(),
             image_cache: HashMap::new(),
             fonts_registered: (0, 0),
-            container_sizes: HashMap::new(),
             laid_out_viewport: None,
             hover_geometry_generation: 0,
             #[cfg(feature = "svg")]
